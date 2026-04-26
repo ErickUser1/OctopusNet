@@ -6,6 +6,19 @@ The design is inspired by the octopus nervous system, where ~2/3 of neurons live
 
 > Undergraduate thesis — Erick, 2026.
 
+## Why OctopusNet?
+
+Centralized networks are fragile. When any component fails, the system collapses.
+
+| Model | Normal accuracy | Critical module fails | Degradation |
+|-------|----------------|-----------------------|-------------|
+| CNN (backprop) | **90.96%** | 10.00% (random chance) | −80.96 pts |
+| OctopusNet (FF) | 52.50% | **41.72%** (Module Dropout) | −10.78 pts |
+
+OctopusNet trades 38% accuracy for **guaranteed resilience**. When the most critical module fails, the system keeps working at 41.72% instead of collapsing. That tradeoff is explicit and structural — not a bug, a design choice.
+
+This matters for robotics, IoT, autonomous vehicles, and embedded systems where a sensor can fail at any time.
+
 ---
 
 ## What is this?
