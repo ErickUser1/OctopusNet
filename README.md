@@ -193,8 +193,8 @@ If you use OctopusNet in your research:
 
 ```bibtex
 @misc{octopusnet2026,
-  author    = {Erick},
-  title     = {OctopusNet: Modular Forward-Forward Network with Local Learning},
+  author    = {Arriola Aguill\'{o}n, Erick},
+  title     = {OctopusNet: Bio-inspired Distributed Neural Architecture},
   year      = {2026},
   publisher = {GitHub},
   url       = {https://github.com/ErickUser1/OctopusNet}
