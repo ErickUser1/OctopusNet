@@ -4,7 +4,7 @@ OctopusNet is a modular neural network that learns without global backpropagatio
 
 The design is inspired by the octopus nervous system, where ~2/3 of neurons live in the arms and compute locally before sending signals to the brain. Each module here is an arm.
 
-> Undergraduate thesis — Erick, 2026.
+> Undergraduate thesis: Erick, 2026.
 
 ## Why OctopusNet?
 
@@ -15,7 +15,7 @@ Centralized networks are fragile. When any component fails, the system collapses
 | CNN (backprop) | **90.96%** | 10.00% (random chance) | −80.96 pts |
 | OctopusNet (FF) | 52.50% | **41.72%** (Module Dropout) | −10.78 pts |
 
-OctopusNet trades 38% accuracy for **guaranteed resilience**. When the most critical module fails, the system keeps working at 41.72% instead of collapsing. That tradeoff is explicit and structural — not a bug, a design choice.
+OctopusNet trades 38% accuracy for **guaranteed resilience**. When the most critical module fails, the system keeps working at 41.72% instead of collapsing. That tradeoff is explicit and structural: not a bug, a design choice.
 
 This matters for robotics, IoT, autonomous vehicles, and embedded systems where a sensor can fail at any time.
 
@@ -27,7 +27,7 @@ OctopusNet is a neural network that learns without global backprop. Instead of o
 
 Inspired loosely by the octopus nervous system, where ~2/3 of neurons live in the arms and process information locally before sending signals to the brain.
 
-Key features: **multiscale input** (each module sees a different resolution), **Fourier label overlay** (labels encoded as frequency patterns instead of pixel patches), and two training modes — standard backprop coordinator or fully local SFF.
+Key features: **multiscale input** (each module sees a different resolution), **Fourier label overlay** (labels encoded as frequency patterns instead of pixel patches), and two training modes: standard backprop coordinator or fully local SFF.
 
 ---
 
@@ -101,7 +101,7 @@ Each module specializes in different classes:
 python train.py --dataset cifar10 --epochs 50
 ```
 
-### SFF mode — 100% local learning
+### SFF mode: 100% local learning
 ```bash
 python train.py --use_sff --dataset cifar10 --epochs 50
 ```
@@ -174,7 +174,7 @@ Upload `OctopusNet_Colab.ipynb` to Colab and run cells. Includes all experiments
 | A8 | With/without nerve ring | Nerve ring adds ~1% |
 | A9 | Homogeneous vs heterogeneous | Heterogeneous kernels help |
 | A10 | GWT competition mechanism | Soft attention wins for N=4 |
-| A15b | SFF local coordinator | 53.16% — best mode |
+| A15b | SFF local coordinator | 53.16%: best mode |
 
 ---
 
@@ -183,19 +183,19 @@ Upload `OctopusNet_Colab.ipynb` to Colab and run cells. Includes all experiments
 **Forward-Forward**
 - Hinton, G. (2022). [The Forward-Forward Algorithm: Some Preliminary Investigations](https://arxiv.org/abs/2212.13345)
 - Krotov & Hopfield (2023). Training CNNs with the Forward-Forward Algorithm. [arXiv:2312.14924](https://arxiv.org/abs/2312.14924)
-- Krutsylo (2025). Scalable Forward-Forward (SFF). [arXiv:2501.03176](https://arxiv.org/abs/2501.03176) — basis for SFF local mode
-- Ortiz Torres et al. (2025). On Advancements of the Forward-Forward Algorithm. [arXiv:2504.21662](https://arxiv.org/abs/2504.21662) — 84.7% CIFAR-10, channel grouping technique
+- Krutsylo (2025). Scalable Forward-Forward (SFF). [arXiv:2501.03176](https://arxiv.org/abs/2501.03176): basis for SFF local mode
+- Ortiz Torres et al. (2025). On Advancements of the Forward-Forward Algorithm. [arXiv:2504.21662](https://arxiv.org/abs/2504.21662): 84.7% CIFAR-10, channel grouping technique
 - ASGE (2025). Adaptive Spatial Goodness Encoding. [arXiv:2509.12394](https://arxiv.org/abs/2509.12394)
-- SCFF (2025). Self-Contrastive Forward-Forward. Nature Communications — 98.70% MNIST, 80.75% CIFAR-10
-- Codellaro et al. (2025). Training CNNs with Forward-Forward: Fourier spatial label encoding. Scientific Reports — basis for Fourier label overlay
+- SCFF (2025). Self-Contrastive Forward-Forward. Nature Communications: 98.70% MNIST, 80.75% CIFAR-10
+- Codellaro et al. (2025). Training CNNs with Forward-Forward: Fourier spatial label encoding. Scientific Reports: basis for Fourier label overlay
 
 **Global Workspace & Coordination**
 - Goyal et al. (ICLR 2022). [Coordination Among Neural Modules Through a Shared Global Workspace](https://arxiv.org/abs/2103.01197)
-- Baars, B. (1988). A Cognitive Theory of Consciousness — original GWT theory
+- Baars, B. (1988). A Cognitive Theory of Consciousness: original GWT theory
 
 **Octopus Neuroscience**
-- Sumbre, G. et al. — Autonomous arm movements in octopus
-- Gutnick, T. et al. — Information flow between brain and arms in octopus
+- Sumbre, G. et al.: Autonomous arm movements in octopus
+- Gutnick, T. et al.: Information flow between brain and arms in octopus
 - Hochner, B. (2012). An Embodied View of Octopus Neurobiology. Current Biology
 
 ---
