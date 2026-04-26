@@ -33,32 +33,7 @@ Key features: **multiscale input** (each module sees a different resolution), **
 
 ## Architecture
 
-```
-                    ┌─────────────────────────┐
-                    │    CENTRAL COORDINATOR   │
-                    │  attention over modules  │
-                    │  → classification head   │
-                    └────────────┬────────────┘
-                                 │
-                        [h'_1 .. h'_N]
-                                 ↑
-                    ┌────────────┴────────────┐
-                    │       NERVE RING        │
-                    │    (Cross-Attention)    │
-                    └────────────┬────────────┘
-                                 │
-                        [h_1, h_2, h_3, h_4]
-                      bottleneck (64 values each)
-                                 ↑
-  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-  │   MODULE 1   │  │   MODULE 2   │  │   MODULE 3   │  │   MODULE 4   │
-  │  kernel 3×3  │  │  kernel 5×5  │  │  kernel 7×7  │  │  kernel 9×9  │
-  │  FF loss ✓   │  │  FF loss ✓   │  │  FF loss ✓   │  │  FF loss ✓   │
-  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
-          ↑                ↑                 ↑                 ↑
-          └────────────────┴─────────────────┴─────────────────┘
-                                  Input image
-```
+![OctopusNet Architecture](architecture.png)
 
 Each module learns to distinguish **positive samples** (image + correct label overlay) from **negative samples** (image + wrong label) using a local goodness score. No gradients flow between modules.
 
