@@ -473,21 +473,34 @@ def create_modules(config):
     input_scales = getattr(config, 'input_scales', None)
     use_grouping = getattr(config, 'ff_channel_grouping', False)
     num_classes = getattr(config, 'num_classes', 10)
+    cpg = getattr(config, 'cg_channels_per_group', 16)
+
+    # CGCNNModule uses heterogeneous kernels [3,5,7,9] by default (A6b config)
+    cg_kernel_sizes = [3, 5, 7, 9]
 
     if config.homogeneous:
         for i, kernel_size in enumerate(config.kernel_sizes[:config.num_modules]):
-            scale = input_scales[i] if use_multiscale and input_scales else input_size
-            k = adaptive_kernel(kernel_size, scale) if use_multiscale else kernel_size
-            module = CNNModule(
-                kernel_size=k,
-                bottleneck_size=config.bottleneck_size,
-                in_channels=in_channels,
-                input_size=scale,
-                ff_threshold=config.ff_threshold,
-                adaptive_threshold=adaptive,
-                num_classes=num_classes,
-                use_channel_grouping=use_grouping,
-            )
+            if use_grouping:
+                module = CGCNNModule(
+                    num_classes=num_classes,
+                    channels_per_group=cpg,
+                    kernel_size=cg_kernel_sizes[i],
+                    in_channels=in_channels,
+                    bottleneck_size=config.bottleneck_size,
+                )
+            else:
+                scale = input_scales[i] if use_multiscale and input_scales else input_size
+                k = adaptive_kernel(kernel_size, scale) if use_multiscale else kernel_size
+                module = CNNModule(
+                    kernel_size=k,
+                    bottleneck_size=config.bottleneck_size,
+                    in_channels=in_channels,
+                    input_size=scale,
+                    ff_threshold=config.ff_threshold,
+                    adaptive_threshold=adaptive,
+                    num_classes=num_classes,
+                    use_channel_grouping=False,
+                )
             modules.append(module)
     else:
         hetero_configs = [
@@ -519,6 +532,54 @@ def create_modules(config):
                 ))
 
     return modules
+
+
+class CGCNNModule(nn.Module):
+    """
+    CNN module with channel grouping (Ortiz Torres et al., arXiv:2504.21662).
+    Drop-in replacement for CNNModule when use_channel_grouping=True.
+
+    Key difference: no external x_neg needed. Channels split into J groups
+    (one per class). FF loss computed from g_target vs mean(g_wrong) in a
+    single forward pass. Eliminates Fourier label overlay dependency.
+
+    A6b results: 64.34% CIFAR-10, single-failure floor 61.12%.
+    """
+
+    def __init__(self, num_classes=10, channels_per_group=16,
+                 kernel_size=3, in_channels=3, bottleneck_size=64):
+        super().__init__()
+        self.num_classes = num_classes
+        self.cpg = channels_per_group
+        total_ch = num_classes * channels_per_group
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, total_ch, kernel_size, padding=kernel_size // 2),
+            nn.BatchNorm2d(total_ch),
+            nn.ReLU(),
+            nn.Conv2d(total_ch, total_ch, kernel_size, padding=kernel_size // 2,
+                      groups=num_classes),
+            nn.BatchNorm2d(total_ch),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(4),
+        )
+        self.proj = nn.Linear(total_ch * 16, bottleneck_size)
+
+    def forward(self, x):
+        return self.proj(self.conv(x).flatten(1))
+
+    def goodness_per_group(self, x):
+        feat = self.conv(x)
+        B, C, H, W = feat.shape
+        return feat.view(B, self.num_classes, self.cpg, H * W).pow(2).mean(dim=[2, 3])
+
+    def ff_loss(self, x, labels, threshold=2.0):
+        g = self.goodness_per_group(x)
+        g_target = g[torch.arange(len(labels)), labels]
+        mask = torch.ones_like(g, dtype=torch.bool)
+        mask[torch.arange(len(labels)), labels] = False
+        g_wrong = g[mask].view(len(labels), self.num_classes - 1).mean(dim=1)
+        return F.softplus(-g_target + threshold).mean() + F.softplus(g_wrong - threshold).mean()
 
 
 class ModuleDecoder(nn.Module):

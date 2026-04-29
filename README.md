@@ -1,6 +1,6 @@
 # 🐙 OctopusNet
 
-OctopusNet is a modular neural network that learns without global backpropagation. Four independent modules process the same image at different resolutions, each trained locally with Hinton's Forward-Forward algorithm, and a central coordinator aggregates their outputs via attention. The result: **53.16% on CIFAR-10 with zero global gradients**.
+OctopusNet is a modular neural network that learns without global backpropagation. Four independent modules process the same image at different resolutions, each trained locally with Hinton's Forward-Forward algorithm, and a central coordinator aggregates their outputs via attention. The result: **64.34% on CIFAR-10 with zero global gradients between modules — and a resilience floor of 61.12% when any single module fails**.
 
 The design is inspired by the octopus nervous system, where ~2/3 of neurons live in the arms and compute locally before sending signals to the brain. Each module here is an arm.
 
@@ -10,12 +10,16 @@ The design is inspired by the octopus nervous system, where ~2/3 of neurons live
 
 Centralized networks are fragile. When any component fails, the system collapses.
 
-| Model | Normal accuracy | Critical module fails | Degradation |
-|-------|----------------|-----------------------|-------------|
-| CNN (backprop) | **90.96%** | 10.00% (random chance) | −80.96 pts |
-| OctopusNet (FF) | 52.50% | **41.72%** (Module Dropout) | −10.78 pts |
+| Model | Normal accuracy | Critical module fails | Two modules fail | Degradation |
+|-------|----------------|-----------------------|-----------------|-------------|
+| CNN (backprop) | **90.96%** | 10.00% (random chance) | — | −80.96 pts |
+| OctopusNet (FF) | 52.50% | 41.72% | ~30% | −10.78 pts |
+| OctopusNet + Channel Grouping (A18b) | 64.17% | 41.47% | 22.32% | −22.70 pts |
+| OctopusNet + CG + Module Dropout (A6b) | **64.34%** | **61.12%** | **52.87%** | **−3.22 pts** |
 
-OctopusNet trades 38% accuracy for **guaranteed resilience**. When the most critical module fails, the system keeps working at 41.72% instead of collapsing. That tradeoff is explicit and structural: not a bug, a design choice.
+FF standard had one catastrophic failure point — losing M1 dropped accuracy to 13.89%, near random chance. Channel grouping eliminates that. Module Dropout goes further: every single-module failure stays above 61%, and even with two modules dead simultaneously the system holds above 52%. The floor is structural, not lucky.
+
+Module Dropout costs nothing in normal accuracy (64.34% vs 64.17%) and adds +19.65 points of resilience floor. It is now the default training mode.
 
 This matters for robotics, IoT, autonomous vehicles, and embedded systems where a sensor can fail at any time.
 
@@ -43,9 +47,11 @@ Each module learns to distinguish **positive samples** (image + correct label ov
 
 | Mode | Accuracy | Notes |
 |------|----------|-------|
-| FF modules + backprop coordinator | **52.75%** | Standard mode |
-| FF modules + SFF local coordinator | **53.16%** | 100% local learning |
-| Simple ensemble average (SFF) | **53.59%** | Best result |
+| FF modules + backprop coordinator | 52.75% | Standard mode |
+| FF modules + SFF local coordinator | 53.16% | 100% local learning |
+| Simple ensemble average (SFF) | 53.59% | Best fully local result |
+| Channel Grouping + coordinator | 64.17% | A18b |
+| Channel Grouping + Module Dropout | **64.34%** | Best overall (A6b) — floor 61.12% |
 
 ### Module specialization (A15b)
 
@@ -71,6 +77,12 @@ Each module specializes in different classes:
 
 ## Training Modes
 
+### A6b mode: best overall (recommended)
+```bash
+python train.py --channel_grouping --module_dropout 0.5 --epochs 30
+```
+64.34% accuracy, single-failure floor 61.12%. Channel grouping (Ortiz Torres et al.) + Module Dropout.
+
 ### Standard mode (FF + backprop coordinator)
 ```bash
 python train.py --dataset cifar10 --epochs 50
@@ -85,14 +97,16 @@ In SFF mode, an `AuxClassifier` attaches to each module's feature map and a `Log
 
 ### Options
 ```
---dataset     cifar10 | cifar100 | mnist  (default: cifar10)
---epochs      int                          (default: 50)
---batch_size  int                          (default: 128)
---bottleneck  int                          (default: 64)
---use_sff        flag                         100% local mode
---no_multiscale  flag                         disable multiscale input
---seed           int                          (default: 42)
---device         cuda | cpu                   (auto-detected)
+--dataset          cifar10 | cifar100 | mnist  (default: cifar10)
+--epochs           int                          (default: 50)
+--batch_size       int                          (default: 128)
+--bottleneck       int                          (default: 64)
+--use_sff          flag                         100% local SFF mode
+--channel_grouping flag                         CGCNNModule (A18b/A6b)
+--module_dropout   float                        module dropout prob (0.5 = A6b)
+--no_multiscale    flag                         disable multiscale input
+--seed             int                          (default: 42)
+--device           cuda | cpu                   (auto-detected)
 ```
 
 ---
@@ -144,12 +158,14 @@ Upload `OctopusNet_Colab.ipynb` to Colab and run cells. Includes all experiments
 |----|------|-------------|
 | A1 | Number of modules (2, 4, 8, 16) | 4 modules optimal |
 | A2 | Bottleneck size (8–128) | 64 best accuracy/size tradeoff |
-| A6 | Module resilience | Accuracy degrades gracefully when modules removed |
+| A6 | Module resilience (FF) | Floor 41.72%, one catastrophic point at 13.89% |
 | A7 | With/without feedback | Feedback adds ~0.5% |
 | A8 | With/without nerve ring | Nerve ring adds ~1% |
 | A9 | Homogeneous vs heterogeneous | Heterogeneous kernels help |
 | A10 | GWT competition mechanism | Soft attention wins for N=4 |
-| A15b | SFF local coordinator | 53.16%: best mode |
+| A15b | SFF local coordinator | 53.16%: best fully local mode |
+| A18b | Channel grouping (Ortiz Torres) | 64.17%: eliminates catastrophic failures, floor 41.47% |
+| A6b | Channel grouping + Module Dropout | 64.34%: floor jumps to 61.12% — +19.65 pts vs A18b, no accuracy cost |
 
 ---
 

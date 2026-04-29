@@ -57,9 +57,14 @@ class OctopusNetConfig:
     ff_threshold: float = 2.0  # Initial value (adapts if adaptive=True)
     ff_adaptive_threshold: bool = True  # DEFAULT: adaptive threshold ON
     ff_epochs_per_layer: int = 100
-    # Channel grouping (A15): single forward pass, goodness split by channel groups
-    # Channels auto-rounded to nearest multiple of num_classes
+    # Channel grouping (Ortiz Torres et al., arXiv:2504.21662)
+    # Replaces CNNModule with CGCNNModule — no x_neg needed, goodness per class group
     ff_channel_grouping: bool = False
+    cg_channels_per_group: int = 16  # total channels = num_classes * cg_channels_per_group
+
+    # Module Dropout (A6b): zero random module during coordinator training
+    # p=0.5 confirmed optimal — forces coordinator to not depend on any single module
+    module_dropout_prob: float = 0.0
 
     # Coordinator
     coordinator_hidden: int = 256
@@ -131,8 +136,22 @@ def get_adaptive_kernels_only_config(dataset="cifar10"):
     )
 
 def get_channel_grouping_config(dataset="cifar10"):
-    """A15: Channel grouping FF — single forward pass, no x_neg generation"""
+    """A18b: Channel grouping FF — single forward pass, no x_neg generation"""
     return OctopusNetConfig(
         dataset=dataset,
         ff_channel_grouping=True,
+        cg_channels_per_group=16,
+    )
+
+def get_a6b_config(dataset="cifar10"):
+    """A6b: Channel Grouping + Module Dropout — best overall config.
+    64.34% accuracy, single-failure floor 61.12%, double-failure floor 52.87%.
+    """
+    return OctopusNetConfig(
+        dataset=dataset,
+        ff_channel_grouping=True,
+        cg_channels_per_group=16,
+        module_dropout_prob=0.5,
+        epochs=30,
+        bottleneck_size=64,
     )

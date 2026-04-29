@@ -8,11 +8,12 @@ Combines:
 - Coordinator with attention and feedback
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules import create_modules
+from modules import create_modules, CGCNNModule
 from nerve_ring import NerveRing, SimpleNerveRing
 from coordinator import Coordinator
 
@@ -130,20 +131,25 @@ class OctopusNet(nn.Module):
             return x
         return F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
 
+    def _is_cg(self):
+        """True if modules are CGCNNModule (channel grouping mode)."""
+        return isinstance(self.modules_list[0], CGCNNModule)
+
     def train_modules_ff(self, x_pos, x_neg=None, labels=None):
         """
         Train all modules with Forward-Forward algorithm.
 
         Two modes:
-        - Standard: x_pos=positive images, x_neg=negative images
-        - Channel grouping: x_pos=images, labels=ground truth (x_neg ignored)
+        - Standard: x_pos=positive images, x_neg=negative images (CNNModule)
+        - Channel grouping: x_pos=images, labels=ground truth (CGCNNModule, no x_neg)
         """
         losses = []
         goodness_pos = []
         goodness_neg = []
 
+        # CG path handled externally in train.py (cg_optimizer with MultiStepLR)
+        # This fallback exists only if called directly without external optimizer
         use_grouping = getattr(self.config, 'ff_channel_grouping', False)
-
         for i, module in enumerate(self.modules_list):
             if use_grouping and labels is not None:
                 loss, g_pos, g_neg = module.train_ff(
@@ -164,29 +170,25 @@ class OctopusNet(nn.Module):
     def train_coordinator(self, x, labels):
         """
         Train coordinator with backprop (modules frozen).
-
-        Args:
-            x: Input images
-            labels: Ground truth labels
-
-        Returns:
-            loss, accuracy
+        If config.module_dropout_prob > 0, zeros a random module per batch
+        with that probability — forces distributed representations (A6b).
         """
-        # Get bottlenecks from modules (no grad)
+        drop_prob = getattr(self.config, 'module_dropout_prob', 0.0)
+
         with torch.no_grad():
-            bottlenecks = []
-            for i, module in enumerate(self.modules_list):
-                h_i = module(self._scale_input(x, i))
-                bottlenecks.append(h_i)
+            bottlenecks = [module(self._scale_input(x, i))
+                           for i, module in enumerate(self.modules_list)]
+
+            if drop_prob > 0.0 and random.random() < drop_prob:
+                drop_idx = random.randint(0, self.num_modules - 1)
+                bottlenecks[drop_idx] = torch.zeros_like(bottlenecks[drop_idx])
+
             bottlenecks = torch.stack(bottlenecks, dim=1)
 
-            # Nerve ring
             if self.nerve_ring is not None:
                 bottlenecks, _ = self.nerve_ring(bottlenecks)
 
-        # Train coordinator
         loss, accuracy = self.coordinator.train_step(bottlenecks, labels)
-
         return loss, accuracy
 
     def predict(self, x):
