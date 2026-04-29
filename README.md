@@ -45,13 +45,13 @@ Each module learns to distinguish **positive samples** (image + correct label ov
 
 ## Results (CIFAR-10)
 
-| Mode | Accuracy | Notes |
-|------|----------|-------|
-| FF modules + backprop coordinator | 52.75% | Standard mode |
-| FF modules + SFF local coordinator | 53.16% | 100% local learning |
-| Simple ensemble average (SFF) | 53.59% | Best fully local result |
-| Channel Grouping + coordinator | 64.17% | A18b |
-| Channel Grouping + Module Dropout | **64.34%** | Best overall (A6b) — floor 61.12% |
+| Mode | Accuracy | Epochs | Notes |
+|------|----------|--------|-------|
+| FF modules + backprop coordinator | 52.75% | 100 | Standard mode |
+| FF modules + SFF local coordinator | 53.16% | 100 | 100% local learning |
+| Simple ensemble average (SFF) | 53.59% | 100 | Best fully local result |
+| Channel Grouping + coordinator | 64.17% | 30 | A18b |
+| Channel Grouping + Module Dropout | **64.34%** | 30 | Best overall (A6b) — floor 61.12% |
 
 ### Module specialization (A15b)
 
