@@ -1,0 +1,1997 @@
+OctopusNet: Red neuronal distribuida con aprendizaje local y comunicación comprimida
+
+1. Abstract
+Las redes neuronales centralizadas son frágiles ante fallos de componentes: si cualquier capa falla, el sistema colapsa. Proponemos OctopusNet, una arquitectura de red neuronal distribuida inspirada en el sistema nervioso del pulpo (Octopus vulgaris), donde dos tercios de las neuronas residen fuera del cerebro central y cada brazo procesa información localmente.
+OctopusNet consta de cuatro módulos CNN paralelos que operan a diferentes resoluciones [32,16,8,4] píxeles, entrenados con el algoritmo Forward-Forward (Hinton, 2022) sin backpropagation global. Cada módulo se comunica con el coordinador central mediante un bottleneck de 64 valores, inspirado en las 30,000 fibras nerviosas del pulpo. El coordinador emplea atención dinámica para ponderar módulos según el input, implementando una arquitectura tipo Global Workspace (Baars, 1988).
+Evaluamos OctopusNet en CIFAR-10 y demostramos: (1) accuracy de 64.34% con channel grouping y Module Dropout, superando todas las variantes previas; (2) resiliencia estructural ante fallos — ante el fallo de cualquier módulo individual, el sistema mantiene mínimo 61.12% vs 10.00% (colapso total) de CNN centralizada equivalente; (3) ante fallo simultáneo de dos módulos, el sistema mantiene mínimo 52.87%; (4) Module Dropout + Channel Grouping combinados eliminan completamente el punto de falla catastrófico sin sacrificar accuracy normal; (5) especialización emergente confirmada — cada módulo captura información genuinamente diferente, evidenciada por caídas de accuracy distintas ante fallos individuales.
+El costo es una brecha de accuracy vs CNN backprop (53.16% vs 90.96%), aceptable en aplicaciones donde la resiliencia es crítica: robótica, IoT, vehículos autónomos, y sistemas embebidos con múltiples sensores.
+
+2. Introducción
+El Deep learning ha revolucionado campos como la visión por computadora, el procesamiento de lenguaje natural y el reconocimiento de patrones. Sin embargo, las arquitecturas predominantes comparten un supuesto: la centralización. Los datos deben concentrarse en un único lugar, los recursos computacionales se agrupan en servidores potentes, y el entrenamiento requiere una conexión estable entre todas las capas de la red mediante backpropagation global. Estos supuestos son razonables para muchos escenarios, pero existen contextos donde no se cumplen. En redes de sensores IoT, los datos se generan de forma distribuida y el ancho de banda es limitado. En hospitales, los datos sensibles no pueden salir del dispositivo por regulaciones de privacidad. 
+ En drones o vehículos autónomos, la resiliencia ante fallas es crítica: si un componente falla, el sistema debe continuar operando. Estos escenarios no invalidan  las arquitecturas centralizadas, pero sugieren la necesidad de explorar alternativas.
+La naturaleza ofrece un modelo notable de procesamiento distribuido: el pulpo (Octopus vulgaris). Este animal posee aproximadamente 500 millones de neuronas, de las cuales dos tercios residen fuera del cerebro central, distribuidas en sus ocho brazos. Cada brazo contiene alrededor de 40 millones de neuronas capaces de procesar información sensorial y tomar decisiones locales sin consultar al cerebro. La comunicación entre brazos y cerebro ocurre mediante apenas 30,000 fibras nerviosas, forzando una compresión extrema de la información. 
+Notablemente, experimentos han demostrado que los brazos del pulpo pueden ejecutar movimientos coordinados incluso cuando están desconectados del cuerpo (Sumbre et al.). Inspirándonos en esta arquitectura biológica, proponemos OctopusNet: una red neuronal distribuida donde múltiples módulos procesan información en paralelo, cada uno especializado en una escala diferente de características. A diferencia de una red secuencial tradicional, donde cada capa espera a la anterior, los módulos de OctopusNet operan simultáneamente. 
+Cada módulo posee su propia función de pérdida local, entrenada mediante el algoritmo Forward-Forward (Hinton, 2022), eliminando la dependencia del backpropagation global. 
+La comunicación con el coordinador central se realiza a través de un bottleneck de 32 valores, análogo a las 30,000 fibras nerviosas del pulpo. El coordinador emplea atención dinámica para determinar qué módulo es más relevante para cada input específico.
+Contribuciones de este trabajo:
+- Primera arquitectura de red neuronal profunda inspirada en el sistema nervioso del pulpo
+- Integración del algoritmo Forward-Forward con módulos paralelos de diferentes escalas
+- Protocolo de comunicación comprimida bio-inspirado mediante bottleneck
+- Mecanismo de coordinación por atención dinámica
+- Feedback top-down mediante modulación multiplicativa (implementando Global Workspace Theory)
+- Nerve ring artificial: comunicación lateral entre módulos via cross-attention
+- Soporte para módulos heterogéneos (CNN + Transformer + RNN en el mismo modelo)
+- Evaluación sistemática de resiliencia ante fallas de módulos
+- Comparación de mecanismos de competición GWT (soft vs Gumbel-hard vs Top-K)
+- Comparación experimental contra red centralizada y Federated Learning en CIFAR-10 y CIFAR-100
+- Jerarquía multi-escala bio-inspirada en corteza visual (V1/V2/V4/IT): cada módulo recibe resolución diferente mediante F.interpolate bilinear
+- Kernels uniformes k=3×3 en todos los módulos: la especialización emerge de resolución diferente, no de kernel size — confirmado empíricamente (módulos k=5,7,9 sobre misma resolución son redundantes)
+- Configuración multi-escala como default: [32,16,8,4] píxeles por módulo para CIFAR, [28,14,7,4] para MNIST — todos los módulos alcanzan sep>0.05 en 200 batches de entrenamiento FF
+- Codificación Fourier espacial de labels con K=0.5: patrones sinusoidales únicos por clase, visibles en toda la imagen; combinación Fourier+multi-escala es novel — Codellaro et al. (Scientific Reports, 2025) usa Fourier en CNN pero resolución única
+- Goodness function global (f3²).mean() sobre el último feature map convolucional: más efectivo que ASGE cuando se combina con multi-escala (sep=0.61 en res=4×4 vs sep≈0 con ASGE diluted)
+
+3. Trabajo relacionado
+Esta sección revisa los fundamentos teóricos y trabajos previos que sustentan OctopusNet, organizados en cinco áreas: el sistema nervioso del pulpo, algoritmos de aprendizaje local, arquitecturas modulares, comunicación comprimida, y enfoques distribuidos existentes.
+
+3.1 El Sistema Nervioso del Pulpo
+El pulpo (Octopus vulgaris) posee aproximadamente 500 millones de neuronas, comparable al número de un perro, pero con una distribución radicalmente diferente. Solo el 10% reside en el cerebro central; el 64% se distribuye en los ocho brazos, con aproximadamente 40 millones de neuronas por brazo (Hochner, 2012). Cada ventosa contiene alrededor de 10,000 neuronas capaces de procesar información táctil y química de forma autónoma. La comunicación entre el cerebro central y los brazos ocurre a través de apenas 30,000 fibras nerviosas, lo que representa menos del 0.01% del total de neuronas. Esta limitación física fuerza un procesamiento local: el cerebro envía comandos de alto nivel ("busca comida") y cada brazo decide autónomamente cómo ejecutarlos (Sumbre et al., 2006). Experimentos han demostrado que brazos completamente desconectados del cuerpo mantienen patrones de movimiento coordinados, evidenciando su autonomía.
+Un estudio reciente en Nature Communications (Zullo et al., 2025) reveló que el cordón nervioso de cada brazo está segmentado en módulos, con neuronas   formando mapas topográficos por ventosa ("suckerotopy"). Esto refuerza la organización modular jerárquica del sistema. Gutnick et al. aclaran un matiz importante: "En lugar de hablar de un pulpo con nueve cerebros, estamos hablando de un pulpo con un cerebro y ocho brazos muy inteligentes." Existe coordinación constante entre lo local y lo central; los brazos no son completamente independientes.
+3.2 Algoritmos de Aprendizaje Local
+El backpropagation (Rumelhart et al., 1986) ha dominado el entrenamiento de redes neuronales durante décadas. Sin embargo, presenta limitaciones biológicas: requiere propagación global del error, transporte de pesos simétricos, y alternancia estricta entre fases forward y backward.
+El algoritmo Forward-Forward (Hinton, 2022) propone una alternativa donde cada capa posee su propia función objetivo local. En lugar de propagar gradientes, cada capa aprende a distinguir entre datos "positivos" (reales) y "negativos" (generados o perturbados) mediante una función de "goodness" basada en la suma de activaciones al cuadrado. Investigaciones recientes han escalado FF a arquitecturas modernas: SCFF (Nature Communications, 2025) alcanzó 98.70% en MNIST y 80.75% en CIFAR-10; VFF-Net (Neural Networks, 2025) superó a backpropagation en MNIST; SFF (arXiv, 2025) fue el primero en aplicar FF a ResNet18 y MobileNetV3, logrando resultados comparables a backprop en CIFAR-100; ASGE (arXiv, 2025) extendió FF a ImageNet completo mediante codificación espacial adaptativa de goodness; y Ortiz Torres et al. (arXiv:2504.21662, 2025) alcanzaron 84.7% en CIFAR-10 integrando random direct feedback connections con FF, cerrando el gap con algoritmos puramente locales supervisados. Nuestro trabajo adopta la codificación Fourier espacial de labels de Codellaro et al. (Scientific Reports, 2025) [27] y la combina por primera vez con entradas multi-escala en una arquitectura modular. La combinación Fourier+multi-escala es novel: a resolución 32×32, la diferencia Fourier entre positivos/negativos se diluye en el goodness global (6.25% del área espacial); a 4×4, el mismo patrón Fourier domina toda la imagen, logrando sep=0.61 en 200 batches.
+Otros algoritmos de aprendizaje local incluyen Greedy InfoMax (Löwe et al., NeurIPS 2019), que entrena módulos aislados maximizando información mutua entre representaciones consecutivas, y NoProp (2025), donde cada bloque aprende independientemente sin propagación global.
+3.3 Arquitecturas Modulares
+Las redes modulares dividen el procesamiento en componentes especializados. El
+survey de Modular Deep Learning (Pfeiffer et al., 2023) identifica tres elementos clave: módulos actualizables localmente, funciones de routing que seleccionan módulos por ejemplo, y funciones de agregación que combinan salidas.
+Mixture of Experts (MoE) representa el enfoque modular más exitoso comercialmente, utilizado en GPT-4 y otros modelos grandes. Sin embargo, MoE difiere fundamentalmente de OctopusNet: utiliza un router centralizado que decide qué experto procesa cada input, los expertos no poseen pérdida local, y si el router falla, todo el sistema falla.
+El estudio "Dynamics of Specialization" (Nature Communications, 2024) demostró que la especialización modular emerge naturalmente cuando existen restricciones de recursos, como un bottleneck de comunicación. Esto respalda nuestra hipótesis de que el bottleneck de 32 valores forzará especialización en los módulos de OctopusNet.
+
+3.4 Comunicación Comprimida
+La teoría del Information Bottleneck (Tishby et al., 2015) establece que la compresión mejora la generalización: "la parte más importante del aprendizaje es olvidar." Las representaciones que retienen solo información relevante generalizan mejor. En el contexto de entrenamiento distribuido, Deep Gradient Compression (Lin et al., 2018) demostró que el 99.9% del intercambio de gradientes es redundante, logrando compresión de 600x sin pérdida de precisión. L-GreCo (MLSys 2024) extendió esto con compresión adaptativa por capa. Estos hallazgos justifican el bottleneck de OctopusNet: si la comunicación de gradientes puede comprimirse 600x, la comunicación de representaciones mediante 32 valores es biológicamente plausible y computacionalmente viable.
+
+3.5 Enfoques Distribuidos Existentes
+Federated Learning (McMahan et al., 2017) entrena N copias idénticas de un modelo en datos distribuidos, promediando periódicamente los pesos en un servidor central. Es efectivo para privacidad pero fundamentalmente diferente a OctopusNet: todos los nodos tienen el mismo modelo, comparten pesos completos (no representaciones comprimidas), y no hay especialización.
+Split Learning (MIT Media Lab) divide un modelo en dos partes: capas iniciales en el cliente, capas finales en el servidor. Mantiene backpropagation end-to-end y no ofrece resiliencia: si cualquier parte falla, el sistema se detiene.
+Los sistemas multiagente distribuyen tareas entre agentes independientes, típicamente con el paradigma CTDE (Centralized Training, Decentralized Execution). Cada agente puede tener objetivos diferentes, lo que genera problemas de coordinación. OctopusNet difiere al ser un único organismo con objetivo compartido.
+3.6 Global Workspace Theory en Sistemas Artificiales Recientes
+
+La Global Workspace Theory (Baars, 1988) ha ganado tracción en arquitecturas de IA recientes. Goyal et al. (ICLR 2022) implementaron GNWT en redes modulares, demostrando que la competición entre módulos y el broadcast global mejora razonamiento causal y generalización fuera de distribución frente a LSTM y Transformers. Su mecanismo central — competition_mlp con Gumbel-softmax para selección binaria — es la inspiración directa del experimento A10 de este trabajo.
+
+Investigación reciente en Frontiers in Robotics and AI (2025) analiza las ventajas funcionales de la estructura Selection-Broadcast cíclica de GWT en sistemas de tiempo real, identificando tres beneficios clave: adaptación dinámica del pensamiento, adaptación basada en experiencia, e inmediatez ante entornos cambiantes. Estas ventajas son especialmente relevantes para los casos de uso de OctopusNet (robótica, IoT, drones) donde el sistema debe reaccionar ante fallos imprevistos.
+
+OctopusNet implementa este ciclo explícitamente: competición (atención dinámica en coordinador) → selección (pesos de atención, soft/Gumbel/Top-K) → broadcast (feedback top-down a módulos). Ningún trabajo previo combina este ciclo GWT completo con aprendizaje local Forward-Forward en una arquitectura modular distribuida.
+
+3.7 El Gap:
+La Tabla 1 resume las diferencias entre enfoques existentes y OctopusNet:
+| Característica           | FL          | Split Learning | MoE    | Multiagente | OctopusNet |
+|--------------------------|-------------|----------------|--------|-------------|------------|
+| Modelo único             | No(N copias)| Sí (Partido)   | Sí     | No          | Sí         |
+| Aprendizaje local        | Sí(BP)      | No             | No     | Sí          | Sí(FF)     |
+| Comunicación comprimida  | No          | No             | N/A    | Variable    | Sí         |
+| Resiliencia              | Parcial     | No             | No     | Sí          | Sí         |
+| Atención dinámica        | No          | No             | Router | No          | Sí         |
+| Feedback top-down        | No          | No             | No     | No          | Sí         |
+| Comunicación lateral     | No          | No             | No     | Parcial     | Sí (nerve) |
+| Módulos heterogéneos     | No          | No             | Sí     | Sí          | Sí         |
+| Bio-inspirada            | No          | No             | No     | No          | Sí         |
+
+Ningún trabajo previo integra: (1) módulos paralelos con escalas diferentes, (2) aprendizaje local via Forward-Forward, (3) comunicación comprimida bio-inspirada, (4) coordinación por atención dinámica, (5) feedback top-down mediante modulación multiplicativa, (6) comunicación lateral entre módulos (nerve ring), y (7) soporte para módulos heterogéneos. Esta integración es la contribución principal de OctopusNet.
+
+4. MÉTODO
+
+4.1 Arquitectura General
+OctopusNet consta de cinco componentes principales: (1) N módulos paralelos que procesan el input simultáneamente (homogéneos o heterogéneos), (2) un canal de comunicación comprimida (bottleneck) entre cada módulo y el nerve ring, (3) un nerve ring que permite comunicación lateral entre módulos via cross-attention, (4) un coordinador central que agrega las representaciones mediante atención dinámica, y (5) un mecanismo de feedback top-down que modula las activaciones de los módulos.
+
+
+
+
+
+
+
+```
+                         ┌──────────────────────────────────┐
+                         │       COORDINADOR CENTRAL         │
+                         │                                   │
+                         │  1. Recibe h'_1..h'_N (32 vals)   │
+                         │  2. Calcula atención α_i          │
+                         │  3. Agrega: h_agg = Σ α_i · h'_i  │
+                         │  4. Output: h_agg → FC → clases   │
+                         │  5. Genera feedback f_i ──────────┼───┐
+                         └───────────┬───────────────────────┘   │
+                                     │                           │
+                            [h'_1, h'_2, h'_3, h'_4]             │
+                    (representaciones enriquecidas)              │
+                                     ↑                           │
+                         ┌───────────┴───────────┐               │
+                         │      NERVE RING       │               │
+                         │   (Cross-Attention)   │               │
+                         │                       │               │
+                         │ h'_i = h_i + Attn(h_i,│               │
+                         │        [h_1..h_N])    │               │
+                         └───────────┬───────────┘               │
+                                     │                           │
+                            [h_1, h_2, h_3, h_4]                 │
+                       bottleneck (64 valores c/u)               │
+                                     ↑                           │
+          ┌──────────────────────────┼───────────────────────────┼──────────────────┐
+          │                          │                           │                  │
+  ┌───────┴───────┐          ┌───────┴───────┐           ┌───────┴───────┐  ┌───────┴───────┐
+  │   MÓDULO 1    │          │   MÓDULO 2    │           │   MÓDULO 3    │  │   MÓDULO N    │
+  │  CNN k=3×3   │          │  CNN k=3×3   │           │  CNN k=3×3   │  │  CNN/Trans/   │
+  │  res=32×32    │          │  res=16×16    │           │  res=8×8      │  │  LSTM, res=4  │
+  │               │          │               │           │               │  │               │
+  │  ×f_1 → proc  │          │  ×f_2 → proc  │           │  ×f_3 → proc  │  │  ×f_N → proc  │
+  │  → bottleneck │          │  → bottleneck │           │  → bottleneck │  │  → bottleneck │
+  │  → FF loss    │          │  → FF loss    │           │  → FF loss    │  │  → FF loss    │
+  └───────┬───────┘          └───────┬───────┘           └───────┬───────┘  └───────┬───────┘
+          │                          │                           │                  │
+          └──────────────────────────┴───────────────────────────┴──────────────────┘
+                                              ↑
+                                         Input (imagen)
+```
+
+Donde N es el número de módulos (por defecto 4). Cada módulo puede ser homogéneo (todos CNNs con kernel 3×3, diferenciados por resolución) o heterogéneo (mezcla de CNN, Transformer, LSTM). El nerve ring permite que cada módulo "vea" lo que descubrieron los demás antes de enviar al coordinador. El feedback f_i del batch anterior modula las activaciones de cada módulo.
+
+4.2 Módulos y Especialización
+Cada módulo es una unidad de procesamiento independiente que comprime su salida a un vector de B valores (por defecto B=32). OctopusNet soporta dos configuraciones:
+
+Configuración homogénea (baseline):
+Todos los módulos son mini-CNNs con tres capas convolucionales, diferenciándose en la resolución del input (no en el kernel). Todos usan kernel 3×3; la especialización emerge de ver el input a diferente escala:
+- Módulo 1: resolución 32×32 (detalles finos, bordes, texturas)    ↔ V1
+- Módulo 2: resolución 16×16 (formas parciales, gradientes)         ↔ V2
+- Módulo 3: resolución  8×8  (regiones semánticas, objetos)         ↔ V4
+- Módulo 4: resolución  4×4  (composición global, distribución)     ↔ IT cortex
+
+Cada módulo recibe el input redimensionado con F.interpolate bilinear. Empíricamente confirmado: kernels 5×5, 7×7, 9×9 sobre la misma resolución 32×32 son redundantes — el coordinador los ignora (pesos de atención ≈0.006 y ≈0.046 para k=5 y k=7). Con multi-escala, todos los módulos alcanzan sep>0.05 en FF en 200 batches (sep: 0.07/0.20/0.30/0.61).
+
+Formalmente: h_i = Bottleneck(Conv3(Conv2(Conv1(Interpolate(x, scale_i)))))
+
+Configuración heterogénea:
+Módulos de diferentes arquitecturas capturan aspectos complementarios:
+- Módulo 1: CNN 3×3 (features espaciales jerárquicas)
+- Módulo 2: CNN 7×7 (contexto espacial amplio)
+- Módulo 3: Mini-Transformer 2 capas (relaciones globales entre patches)
+- Módulo 4: LSTM bidireccional (patrones secuenciales en scanlines)
+
+Formalmente: h_i = Bottleneck(Arquitectura_i(x))
+
+El único requisito es que cada módulo produzca un vector de B valores. El coordinador no necesita saber qué tipo de módulo produjo cada representación.
+
+La especialización emerge por dos factores: (1) diferentes resoluciones de entrada fuerzan a cada módulo a capturar features a escalas genuinamente distintas (confirmado empíricamente: diferentes kernels sobre misma resolución producen módulos redundantes), y (2) el bottleneck fuerza a cada módulo a comprimir solo la información más relevante desde su perspectiva.
+
+4.2.1 Jerarquía Multi-Escala: Analogía con Corteza Visual
+
+La configuración por defecto de OctopusNet envía el input a cada módulo a diferente resolución, análoga a la jerarquía V1/V2/V4/IT de la corteza visual de mamíferos. Esta decisión de diseño es empíricamente necesaria: sin multi-escala, los módulos con diferentes kernels sobre la misma resolución capturan información redundante (ver Observación A1-obs). El experimento A12b evalúa esta decisión comparando con una configuración de resolución única.
+
+  Módulo 1: 32×32 (resolución completa) → detalles finos, bordes, texturas   ↔ V1
+  Módulo 2: 16×16 (½ resolución)        → formas parciales, gradientes        ↔ V2
+  Módulo 3:  8×8  (¼ resolución)        → regiones semánticas, objetos        ↔ V4
+  Módulo 4:  4×4  (⅛ resolución)        → composición global, distribución    ↔ IT cortex
+
+La implementación usa F.interpolate con modo bilinear y align_corners=False, aplicado antes de cada módulo en el forward pass. No requiere módulos adicionales — es un preprocesamiento diferenciado por módulo.
+
+Esta jerarquía tiene una consecuencia importante para el nerve ring: el cross-attention ahora cruza información entre representaciones de diferentes resoluciones. El módulo fino puede "consultar" al módulo grueso sobre la estructura global antes de comprimir al bottleneck — análogo a las conexiones feedback V4→V1 documentadas en corteza visual (Yamins & DiCarlo, 2016).
+
+Motivación empírica: En experimentos preliminares con configuración de resolución única (32×32, kernels 3×3/5×5/7×7/9×9), el coordinador asignó pesos de atención altamente concentrados en los dos módulos extremos (M1 k=3: 0.596, M4 k=9: 0.352) ignorando los módulos intermedios (M2≈0.006, M3≈0.046). Este resultado confirma que kernels intermedios sobre la misma resolución capturan información redundante. Con multi-escala (default en OctopusNet), todos los módulos alcanzan sep>0.05 en FF (sep: 0.07/0.20/0.30/0.61 para res=32/16/8/4), y se espera distribución de atención más equilibrada. El experimento A12b documenta esta comparación sistemáticamente. Ver sección 5.7, Observación A1-obs para datos completos.
+
+4.2.2 Elección de Kernel
+
+En la configuración por defecto, todos los módulos usan kernel 3×3 independientemente de su resolución. Esto es suficiente porque la variedad de escalas ya fuerza especialización: un kernel 3×3 sobre 32×32 captura detalles finos equivalentes a un campo receptivo efectivo muy pequeño, mientras que el mismo kernel 3×3 sobre 4×4 captura casi la imagen completa.
+
+Se probaron kernels adaptativos (k_adaptativo = min(kernel_size, mayor_impar ≤ resolución_módulo)) pero no mejoran el FF goodness separation. Con multi-escala, el receptive field efectivo ya escala por resolución. El experimento A12a compara kernel fijo 3×3 vs kernels adaptativos por resolución.
+
+La analogía biológica se mantiene: las neuronas de V1 tienen campos receptivos de ~1° de arco visual; las de IT cortex tienen campos de ~50°. En OctopusNet esta proporcionalidad emerge de las resoluciones [32,16,8,4], no del tamaño de kernel.
+
+4.3 Forward-Forward como Función de Pérdida Local
+Cada módulo posee su propia función de pérdida, entrenada mediante el algoritmo Forward-Forward (Hinton, 2022). A diferencia del backpropagation, donde una única loss al final de la red propaga gradientes hacia atrás, FF define un objetivo local por módulo.
+El proceso de entrenamiento para cada módulo consiste en dos fases:
+Fase positiva: el módulo recibe un dato real x+ y calcula la goodness de su representación:
+ goodness(h) = Σ h_j²     (suma de activaciones al cuadrado)
+El módulo aprende a producir goodness alta para datos reales.
+Fase negativa: el módulo recibe un dato negativo x- (generado mediante perturbación del input o asignación de labels incorrectos) y aprende a producir goodness baja.
+La loss local del módulo i es:
+L_i = -log(σ(goodness(h_i+) - θ)) - log(σ(θ - goodness(h_i-)))
+Donde σ es la función sigmoide y θ es un umbral (threshold).
+Esta formulación permite que cada módulo entrene de forma completamente independiente, sin esperar señales de otros módulos ni del coordinador. Esto habilita entrenamiento paralelo real.
+
+4.3.1 Threshold Adaptativo (Experimento A11)
+
+El threshold θ es un hiperparámetro crítico: si es muy bajo, todo parece positivo; si es muy alto, todo parece negativo. El valor por defecto (θ=2.0) proviene del paper original de Hinton, pero puede no ser óptimo para todas las arquitecturas.
+
+Proponemos un **threshold adaptativo** que se ajusta automáticamente durante el entrenamiento:
+
+```
+θ_t = (mean(g_pos) + mean(g_neg)) / 2
+```
+
+En cada batch, el threshold se calcula como el punto medio entre la goodness promedio de los datos positivos y negativos. Esto garantiza que el umbral siempre esté en la posición óptima para separar ambas distribuciones, independientemente de la escala de las activaciones.
+
+Ventajas:
+- No requiere tuning manual del hiperparámetro
+- Se adapta a diferentes arquitecturas de módulos
+- Robusto ante cambios en la distribución de activaciones durante el entrenamiento
+
+El experimento A11 compara el threshold fijo vs adaptativo.
+
+4.3.2 Función de Goodness: Media Global sobre Último Feature Map
+
+La implementación usa goodness global calculada sobre el último feature map convolucional (f3):
+
+  goodness(x) = mean(f3²)   sobre dimensiones [batch, channels, H, W]
+
+  Equivalente: (f3 ** 2).mean(dim=[1, 2, 3])
+
+Esta formulación fue seleccionada empíricamente. Se evaluaron dos alternativas:
+
+**ASGE (Adaptive Spatial Goodness Encoding)**: calcula energía por patches espaciales en feature maps intermedios. En experimentos iniciales produjo sep≈0.0006 — la señal Fourier queda diluida al promediar sobre todos los patches de una imagen 32×32 (el label ocupa ~6.25% del área). ASGE falla cuando la señal de clase no ocupa el feature map completo.
+
+**Goodness global sobre f3 + multi-escala**: La media global sobre toda la imagen parece también susceptible al problema de dilución, pero la clave está en la interacción con las resoluciones: a 32×32, sep=0.07 (señal diluida pero detectable); a 4×4, el mismo patrón Fourier domina toda la imagen → sep=0.61.
+
+Resultados empíricos por módulo (200 batches, CIFAR-10, Fourier K=0.5):
+  Módulo 1 (32×32): g_pos=0.61, g_neg=0.54, sep=0.07  ✓
+  Módulo 2 (16×16): g_pos=0.82, g_neg=0.62, sep=0.20  ✓
+  Módulo 3 (8×8):   g_pos=0.93, g_neg=0.63, sep=0.30  ✓
+  Módulo 4 (4×4):   g_pos=1.40, g_neg=0.79, sep=0.61  ✓
+
+Resultados tras entrenamiento completo (modelo v3 + ModDrop, 100 épocas, CIFAR-10):
+  Módulo 1 (32×32): g_pos=16.551, g_neg=14.307, sep=2.243  ✓
+  Módulo 2 (16×16): g_pos=33.690, g_neg=30.056, sep=3.633  ✓
+  Módulo 3 (8×8):   g_pos=31.852, g_neg=28.441, sep=3.411  ✓
+  Módulo 4 (4×4):   g_pos=11.487, g_neg=9.642,  sep=1.845  ✓
+
+  La separación creció 10-30x respecto al diagnóstico inicial — confirmando que el
+  entrenamiento FF converge correctamente. Sep > 1.8 en todos los módulos indica que
+  los negativos Fourier no son el cuello de botella del accuracy — el límite está en
+  la capacidad del coordinador y la naturaleza de FF vs backprop.
+
+**Estabilización de activaciones — LayerNorm entre capas conv:**
+
+Sin normalización, g_pos crece exponencialmente entre épocas (6× por época en M1, NaN en época 3). El threshold adaptativo no frena esto porque la loss puede seguir bajando aunque ambas goodness escalen juntas — solo importa la diferencia, no la magnitud absoluta.
+
+Siguiendo Hinton (2022) y Codellaro et al. (Scientific Reports, 2025), aplicamos LayerNorm después de f1 y f2 antes de pasarlos a la siguiente capa convolucional. La goodness se mide sobre f3 sin normalizar:
+
+  f1 = ReLU(Conv1(x))
+  f2 = ReLU(Conv2(LayerNorm(f1)))
+  f3 = ReLU(Conv3(LayerNorm(f2)))
+  goodness = mean(f3²)
+
+Esto pasa solo la orientación del vector de activación, no la magnitud — haciendo el crecimiento ilimitado estructuralmente imposible para capas subsecuentes. Resultado empírico: g_pos crece de forma sublineal (×2 en 5 épocas vs ×40 sin LayerNorm), sep crece consistentemente hasta >1.0.
+
+El experimento A14 compara goodness global vs ASGE para documentar esta diferencia.
+
+4.3.3 Channel Grouping: Un Solo Forward Pass (Experimento A15)
+
+El entrenamiento FF estándar requiere generar datos negativos (x_neg) para cada batch — un paso de preprocesamiento con costo computacional y potencial ruido si los negativos son fáciles de separar. Adoptamos la técnica de agrupación de canales de Ortiz Torres et al. (arXiv:2504.21662, 2025), que elimina x_neg completamente.
+
+El mecanismo divide los canales de cada feature map en J grupos, uno por clase:
+
+  S = C / J    (canales por grupo, C redondeado a múltiplo de J)
+
+  Para cada muestra n y clase j:
+  G_{n,j} = (1 / S·H·W) · Σ Y[n, j·S:(j+1)·S, :, :]²
+
+  g_pos_n = G[n, label_n]              (goodness del grupo de la clase correcta)
+  g_neg_n = mean(G[n, j] para j ≠ label_n)   (media de grupos incorrectos)
+
+Un solo forward pass genera tanto g_pos como g_neg internamente. La red aprende que los canales del grupo correcto deben activarse más que los demás.
+
+Ventajas:
+- Elimina generación de x_neg — 50% menos forward passes durante entrenamiento
+- Goodness más estable: g_neg es promedio de J-1 grupos, no un solo negativo aleatorio
+- Compatible con goodness global: el channel grouping aplica la misma media² sobre grupos de canales del último feature map
+
+Ajuste de canales: con J=10 clases, los 64 canales de la primera capa se redondean a 70 (7 canales por grupo). Esto ocurre solo durante construcción del módulo y no afecta la inferencia.
+
+El experimento A15 compara FF estándar (x_pos/x_neg) vs channel grouping en accuracy y tiempo de entrenamiento.
+
+4.4 Bottleneck: Comunicación Comprimida
+Inspirado en las 30,000 fibras nerviosas del pulpo, cada módulo comunica su resultado al coordinador exclusivamente a través de un bottleneck: una capa fully-connected que reduce la salida del módulo a un vector de B valores (por defecto B=64). La compresión es significativa. Un módulo con tres capas convolucionales de 64, 128 y 256 filtros produce un feature map de miles de valores. El bottleneck lo comprime a 64, una reducción de aproximadamente 7,500x. Solo la información más relevante sobrevive esta compresión.
+
+Feature map (256 × 2 × 2 = 1,024 valores tras AdaptiveAvgPool)
+                ↓
+        Flatten + FC
+                ↓
+Bottleneck (64 valores = 256 bytes)
+
+En transmisión, esto equivale a enviar 256 bytes por módulo, comparado con cientos de kilobytes que requeriría enviar el feature map completo o el modelo completo como en Federated Learning.
+
+**Selección empírica de B:** Se evaluaron B ∈ {32, 64, 128, 256} midiendo la separación FF (sep = g_pos - g_neg) en módulos aislados tras 3 épocas. Los resultados muestran un máximo claro en B=64:
+
+  B=32:  sep promedio = 0.949  (M1=0.530, M2=0.999, M3=1.291, M4=0.975)
+  B=64:  sep promedio = 1.227  (M1=0.752, M2=1.289, M3=1.763, M4=1.102)  ← óptimo
+  B=128: sep promedio = 1.071  (M1=0.710, M2=1.132, M3=1.465, M4=0.975)
+  B=256: sep promedio = 1.234  (M1=0.734, M2=1.343, M3=1.765, M4=1.094)
+
+B=64 y B=256 producen sep casi idéntico, pero B=64 es 4× más eficiente en el coordinador. Esto sugiere un equilibrio óptimo entre capacidad de representación y eficiencia, consistente con la hipótesis del Information Bottleneck (Tishby et al., 2015): comprimir fuerza a retener solo información relevante.
+4.5 Nerve Ring: Comunicación Lateral entre Módulos
+Inspirado en el anillo nervioso del pulpo que conecta los brazos entre sí, el nerve ring permite que cada módulo "vea" lo que descubrieron los demás antes de enviar al coordinador. Esto se implementa mediante cross-attention:
+
+1. Cada módulo produce su bottleneck h_i (32 valores)
+2. Cross-attention enriquece cada representación:
+   h'_i = h_i + Attention(Q=h_i, K=[h_1..h_N], V=[h_1..h_N])
+3. Las representaciones enriquecidas h'_i van al coordinador
+
+Esto permite coordinación lateral sin romper la independencia de los módulos: cada uno sigue entrenando con FF loss local, pero su representación se enriquece con contexto de los demás.
+
+4.6 Coordinador con Atención Dinámica
+El coordinador central recibe las representaciones enriquecidas h'_1, h'_2, ..., h'_N del nerve ring y debe combinarlas en una decisión final. Empleamos un mecanismo de atención que pondera dinámicamente la contribución de cada módulo según el input.
+El proceso es:
+1. Se calcula un vector query q a partir de la concatenación de todas las representaciones:
+   q = W_q · [h'_1; h'_2; ...; h'_N]
+
+2. Se calcula un score de atención para cada módulo:
+   α_i = softmax(q · h'_i / √B)
+
+3. La representación agregada es la suma ponderada:
+   h_agg = Σ α_i · h'_i
+
+4. El coordinador produce la salida final:
+   output = FC_out(FC_dec(h_agg))
+
+Donde FC_dec: ℝ^B → ℝ^256 → ℝ^128 y FC_out: ℝ^128 → ℝ^C.
+La atención permite que el coordinador asigne mayor peso al módulo más informativo para cada input específico.
+
+4.6.1 Mecanismos de Competición Inspirados en GWT (Experimento A10)
+
+La Global Workspace Theory (Baars, 1988; Goyal et al., ICLR 2022) postula que los módulos especializados compiten por acceso a un "workspace" compartido de capacidad limitada. Solo los módulos que "ganan" la competición pueden broadcast su información al resto del sistema.
+
+Nuestra implementación por defecto usa softmax suave, pero el paper oficial de GWT (Goyal et al.) utiliza mecanismos de selección más estrictos. Implementamos tres variantes para el experimento A10:
+
+**A10a - Soft Attention (Baseline):**
+```
+α_i = softmax(scores)
+```
+Todos los módulos contribuyen con pesos proporcionales a sus scores. Es diferenciable y estable, pero menos fiel a la competición binaria de GWT.
+
+**A10b - Gumbel-Softmax con Selección Dura:**
+```
+α_i = Gumbel-Softmax(scores, τ=0.5, hard=True)
+```
+Durante el forward pass produce vectores one-hot (selección dura), pero durante el backward pass usa gradientes suaves para permitir entrenamiento. Más fiel a GWT donde solo un módulo "gana" el acceso al workspace.
+
+**A10c/A10d - Top-K Sparse Attention:**
+```
+mask = TopK(scores, k)
+α_i = softmax(scores * mask + (1-mask) * -∞)
+```
+Solo los K módulos con mayor score contribuyen. Con K=2, dos módulos comparten el workspace. Con K=1, es "winner-take-all" puro.
+
+Justificación teórica:
+- El paper de Goyal et al. usa `competition_mlp` con Gumbel-softmax para selección binaria
+- La sparsity (Top-K) reduce ruido de módulos irrelevantes y puede mejorar especialización
+- La competición dura fuerza a cada módulo a ser "el mejor" en su dominio para ser seleccionado
+
+El experimento A10 confirma que soft attention es el mecanismo óptimo para OctopusNet con N=4 módulos (43.72% vs 39.33% Gumbel, 42.32% Top-2, 38.09% Top-1). La selección dura tiene sentido en GWT biológico con miles de módulos compitiendo — a N=4, zerear módulos pierde información crítica y destabiliza el entrenamiento.
+
+4.7 Flujo de Ejecución
+El procesamiento de un input x sigue siete pasos:
+
+1. Modulación (excepto primer batch): cada módulo aplica el feedback f_i del batch anterior
+   activaciones_moduladas = activaciones × f_i
+
+2. Distribución: x se envía idénticamente a los N módulos
+
+3. Procesamiento local: cada módulo procesa x en paralelo con su arquitectura (CNN/Transformer/LSTM, modulada por f_i)
+
+4. Aprendizaje local (solo en entrenamiento): cada módulo evalúa su FF loss con datos positivos y negativos
+
+5. Compresión: cada módulo reduce su salida a B valores via bottleneck → h_i
+
+6. Nerve ring: cross-attention entre módulos enriquece cada h_i → h'_i
+
+7. Agregación + Feedback: el coordinador recibe N vectores h'_i, aplica atención, genera output, y calcula f_i para el siguiente batch
+
+Diagrama del ciclo completo:
+
+```
+Batch t:
+                                    ┌─────────────────────┐
+                                    │    COORDINADOR      │
+                                    │                     │
+                                    │ 1. Recibe h'_1..h'_N│
+                                    │ 2. Calcula α_i      │
+                                    │ 3. Agrega → output  │
+                                    │ 4. Genera f_i ──────┼───┐
+                                    └──────────┬──────────┘   │
+                                               │              │
+                                     [h'_1, h'_2, h'_3, h'_4] │
+                                    (enriquecidos por nerve)  │
+                                               ↑              │
+                                    ┌──────────┴──────────┐   │
+                                    │     NERVE RING      │   │
+                                    │  Cross-Attention    │   │
+                                    │  h'_i = h_i + Attn  │   │
+                                    └──────────┬──────────┘   │
+                                               │              │
+                                      [h_1, h_2, h_3, h_4]    │
+                                      (bottlenecks 64 vals)   │
+                                               ↑              │
+                      ┌────────────────────────┼──────────────┼────────────────┐
+                      │                        │              │                │
+              ┌───────┴───────┐        ┌───────┴───────┐      │        ┌───────┴───────┐
+              │   MÓDULO 1    │        │   MÓDULO 2    │      │        │   MÓDULO N    │
+              │   CNN/Trans   │        │   CNN/Trans   │      │        │   CNN/LSTM    │
+         ┌───→│ ×f_1 → proc   │   ┌───→│ ×f_2 → proc   │      │   ┌───→│ ×f_N → proc   │
+         │    │    → h_1      │   │    │    → h_2      │      │   │    │    → h_N      │
+         │    └───────────────┘   │    └───────────────┘      │   │    └───────────────┘
+         │                        │                           │   │
+         │                        │                           │   │
+         └────────────────────────┴───────────────────────────┴───┘
+                                  f_i del batch anterior
+                                  (feedback loop)
+```
+
+El feedback crea un ciclo: el coordinador influye en cómo procesarán los módulos el SIGUIENTE input. El nerve ring permite coordinación lateral entre módulos.
+
+4.8 Feedback Top-Down: Modulación del Coordinador a los Módulos
+
+Inspirado en la comunicación bidireccional del pulpo (donde el cerebro envía comandos globales y los brazos combinan estos con señales locales), implementamos un mecanismo de feedback mediante modulación multiplicativa.
+
+El proceso funciona así:
+
+1. En el batch t, los módulos procesan y envían sus 32 valores al coordinador
+2. El coordinador calcula los pesos de atención α_i para cada módulo
+3. El coordinador genera un vector de feedback f_i ∈ ℝ^B para cada módulo:
+
+   f_i = σ(W_f · [h_agg; α_i])
+
+   Donde σ es sigmoide (valores entre 0 y 1), h_agg es la representación agregada, y α_i es el peso de atención del módulo i.
+
+4. En el batch t+1, cada módulo aplica modulación multiplicativa en su capa intermedia:
+
+   activaciones_moduladas = activaciones × f_i
+
+5. Módulos con f_i cercano a 1 → señal sin cambio
+   Módulos con f_i cercano a 0 → señal suprimida
+   Módulos con f_i > 1 (si usamos otra activación) → señal amplificada
+
+Justificación biológica:
+- El cerebro del pulpo envía "comandos globales" por el tracto cerebrobraquial (CBT)
+- Cada brazo combina el comando central + señales sensoriales locales
+- No es "el cerebro dice cómo moverse", es "el cerebro da contexto, el brazo decide"
+
+Justificación computacional (Harvard, NeurIPS 2023):
+- La modulación multiplicativa permite "apagar" neuronas irrelevantes (multiplicar por 0)
+- Sin feedback, la señal pasa sin cambio (no inventa activaciones)
+- Previene alucinaciones cuando el contexto indica que cierto módulo no es relevante
+
+Conexión con Global Workspace Theory (Goyal et al., ICLR 2022):
+El feedback implementa el "broadcast" de la Global Workspace. Después de que los módulos compiten por atención (ignition), el workspace envía información de vuelta a todos los módulos. Sin feedback, solo hay competencia. Con feedback, hay el ciclo completo de la GWT.
+
+Diferencia con la atención:
+- Atención: pondera las salidas DESPUÉS de que los módulos procesan
+- Feedback: modula las activaciones ANTES/DURANTE el procesamiento del siguiente input
+
+4.9 Resiliencia ante Fallas
+Si el módulo j falla o se desconecta, el sistema se adapta sin reentrenamiento. La atención del coordinador redistribuye automáticamente los pesos entre los módulos restantes:
+
+  α_i = softmax(q · h_i / √B)    para todo i ≠ j
+
+El accuracy se degrada proporcionalmente al número de módulos perdidos, pero el sistema no colapsa. Esto contrasta con una red secuencial, donde la falla
+de cualquier capa intermedia detiene todo el procesamiento, y con Federated Learning, donde la pérdida del servidor central paraliza la agregación.
+
+4.10 Generación de Datos Negativos para Forward-Forward
+
+El algoritmo Forward-Forward requiere datos negativos para entrenar cada módulo. Siguiendo el enfoque de Hinton (2022), generamos datos negativos asignando labels incorrectos al input original:
+
+  Dato positivo: imagen + label correcto (ej: imagen de gato + "gato")
+  Dato negativo: imagen + label incorrecto (ej: imagen de gato + "perro")
+
+El problema del enfoque original (label en primeros píxeles) es que las capas convolucionales solo ven el label cuando el filtro está posicionado en la esquina superior izquierda. Para la mayoría de posiciones de filtro, el label es invisible — la red aprende goodness sin información de clase para gran parte del campo receptivo.
+
+4.10.1 Codificación Fourier Espacial de Labels (Experimento A13)
+
+Adoptamos la técnica de codificación espacialmente extendida de "Training CNNs with FF" (Scientific Reports, 2025). Cada clase recibe un patrón sinusoidal único que cubre toda la imagen:
+
+  Para la clase c: patrón_c(x, y) = sin(f_c · (x·cos(θ_c) + y·sin(θ_c)))
+
+  Donde f_c y θ_c son frecuencia y orientación únicas por clase:
+  - 4 orientaciones: 0°, 45°, 90°, 135°
+  - 3 frecuencias: 1, 2, 3 ciclos
+  - 12 combinaciones totales (≥ num_classes para CIFAR-10/100)
+
+El label se incorpora como mezcla ponderada:
+
+  x_labeled = imagen · (1 - K) + patrón_c · K    con K = 0.5
+
+Ventajas sobre one-hot en primeros píxeles:
+- El label es visible en cada posición espacial de la imagen
+- Cualquier filtro convolucional en cualquier posición detecta la clase
+- Escala naturalmente con F.interpolate: el patrón Fourier mantiene coherencia a cualquier resolución
+- K=0.5 balance empíricamente confirmado: a res=32×32, sep=0.07; a res=4×4, sep=0.61
+
+Interacción crítica Fourier + multi-escala: a 32×32, la diferencia Fourier (Δ≈0.20 por píxel) se diluye en la goodness global porque la red ve el patrón mezclado con información de imagen real a escala completa. A 4×4, el downscaling concentra el patrón: los 16 píxeles de la imagen 4×4 representan regiones 8×8 en el original, donde el sinusoide es promediado — y ese promedio aún tiene señal de clase. Por eso sep escala inversamente con resolución.
+
+Nota sobre la referencia: Codellaro et al. (Scientific Reports, 2025) usa K=0.5 en CNN con resolución fija 32×32 y reporta sep≈0.07, consistente con nuestros resultados. Su trabajo valida la técnica; nuestra contribución es combinarla con multi-escala para amplificar la señal en módulos de baja resolución.
+
+El experimento A13 compara Fourier labeling vs one-hot original.
+
+En los experimentos de ablación (A4), evaluamos variantes adicionales de datos negativos:
+- Ruido gaussiano añadido al input
+- Mezcla de dos imágenes (overlay)
+- Máscaras aleatorias que ocultan partes del input
+
+4.11 Entrenamiento del Coordinador
+
+Los módulos se entrenan con Forward-Forward (aprendizaje local). El coordinador se entrena con backpropagation estándar usando Cross-Entropy Loss sobre la clasificación final.
+
+Crucialmente, los gradientes del coordinador NO se propagan hacia los módulos. El bottleneck actúa como un "corte de gradiente" (gradient stop):
+
+  Módulo 1 ──→ [bottleneck] ──┐
+  Módulo 2 ──→ [bottleneck] ──┼──→ Coordinador ──→ Loss (CE)
+  Módulo 3 ──→ [bottleneck] ──┘         ↑
+                                        │
+                              Backprop solo aquí
+                              (no cruza el bottleneck)
+
+Esta arquitectura híbrida mantiene el aprendizaje local en los módulos mientras permite supervisión efectiva en el coordinador. Es análoga a Split Learning, donde el "cut layer" separa el entrenamiento cliente-servidor.
+
+4.12 Consideraciones Teóricas
+
+Esta sección aborda tres desafíos fundamentales de las arquitecturas con aprendizaje local distribuido.
+
+4.12.1 Coherencia Global: ¿Converge el sistema?
+
+Cada módulo optimiza su propia FF loss, lo que plantea la pregunta: ¿quién garantiza que el sistema completo converge hacia un objetivo común?
+
+El coordinador actúa como mecanismo de alineación global:
+
+```
+Módulo 1: FF loss local → "mis features son buenas"
+Módulo 2: FF loss local → "mis features son buenas"
+Módulo 3: FF loss local → "mis features son buenas"
+                    ↓
+Coordinador: CrossEntropy → "pero juntos clasificaron MAL"
+                    ↓
+            Atención ajusta → reduce peso de módulos inconsistentes
+                    ↓
+            Feedback modula → suprime módulos que no aportan
+```
+
+Mecanismos de alineación:
+1. Atención dinámica: el coordinador aprende a ponderar módulos según su utilidad para la tarea global
+2. Feedback multiplicativo: suprime activaciones de módulos cuya contribución no mejora el accuracy
+3. Consistencia emergente: módulos que no ayudan reciben menos peso; sus features gradualmente se vuelven menos influyentes
+
+Conexión teórica con Global Workspace Theory (Baars, 1988; Goyal et al., ICLR 2022):
+La arquitectura de OctopusNet implementa implícitamente una Global Workspace:
+- Módulos = especialistas funcionales
+- Bottleneck = canal de comunicación con ancho de banda limitado
+- Atención = competencia por acceso al workspace
+- Feedback = broadcast del workspace hacia los módulos
+
+Esta conexión proporciona justificación teórica adicional: la coherencia global emerge cuando módulos compiten por un recurso compartido limitado (el workspace/coordinador).
+
+Limitación honesta: si un módulo aprende features "buenas para FF" pero "malas para clasificación", no hay corrección directa. El coordinador solo puede reducir su influencia, no modificar sus pesos.
+
+4.12.2 Interacción entre Módulos
+
+El nerve ring (sección 4.5) resuelve el problema de comunicación lateral entre módulos. Cada módulo procesa el input de forma independiente, pero antes de enviar al coordinador, el nerve ring permite que cada representación h_i se enriquezca con información de los demás módulos via cross-attention.
+
+Esta arquitectura permite:
+- Paralelismo real: cada módulo procesa independientemente
+- Especialización natural: diferentes arquitecturas capturan diferentes aspectos
+- Coordinación emergente: el nerve ring y la atención combinan perspectivas
+- Resiliencia: si un módulo falla, los demás compensan
+
+Referencia: Graph Neural Network-based Multi-agent Coordination (2024) demuestra que este tipo de comunicación mejora coordinación bajo observabilidad parcial.
+
+4.12.3 Credit Assignment: ¿Quién causó el error?
+
+Sin backpropagation global, no existe un gradiente que identifique qué módulo causó un error sistémico. Este es el problema histórico del aprendizaje distribuido.
+
+Mecanismos parciales de credit assignment en OctopusNet:
+
+1. Pesos de atención como indicador implícito:
+   - Si α_i es consistentemente bajo → módulo i no contribuye útilmente
+   - No identifica "culpa" exacta, pero señala utilidad relativa
+
+2. Feedback basado en error anterior:
+   ```
+   Si error_t fue alto y α_i era alto:
+       → f_i disminuye en t+1
+       → "quien más contribuyó cuando fallamos, probablemente contribuyó al fallo"
+   ```
+
+3. FF tiene credit assignment local:
+   - Cada módulo sabe si su goodness fue correcta (alta para positivos, baja para negativos)
+   - No sabe si eso ayudó al sistema global, pero sabe si cumplió su objetivo local
+
+Limitación honesta: el credit assignment global no está resuelto elegantemente. Un módulo podría tener goodness perfecta pero producir features inútiles para la tarea.
+
+Soluciones emergentes en la literatura (2024-2025):
+
+1. Counter-Current Learning (NeurIPS 2024): usa "pairwise local loss" comparando activaciones feedforward vs feedback, con gradient detaching para mantener localidad.
+
+2. Forward Target Propagation (2025): reemplaza backward pass con un segundo forward pass que estima targets por capa. Completamente modular y local.
+
+3. Neural Manifold Noise Correlation (2026): perturba activaciones y correlaciona con cambios en output para estimar gradientes sin backprop. Escala mejor que noise correlation tradicional.
+
+Para OctopusNet, la solución más compatible sería Forward Target Propagation, ya que mantiene la filosofía forward-only. Esto queda como trabajo futuro.
+
+Métricas adicionales a explorar:
+- Mutual information entre bottleneck y labels
+- Gradiente sintético del coordinador hacia módulos
+- Pruning automático de módulos con bajo impacto en accuracy
+
+4.13 Mapeo Biológico
+  ┌───────────────────────────────────┬──────────────────────────┬─────────────────────────────────────┐
+  │       Componente biológico        │ Componente en OctopusNet │               Detalle               │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Cerebro central (50M neuronas)    │ Coordinador              │ Atención + FC: N×B → 256 → 128 → C  │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Brazo (40M neuronas c/u)          │ Módulo local             │ CNN/Transformer/LSTM + bottleneck   │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Ventosas (10K neuronas c/u)       │ Primera capa del módulo  │ Percepción directa del input        │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ 30,000 fibras nerviosas           │ Bottleneck               │ Capa FC de B neuronas (B=64)        │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Anillo nervioso inter-brazos      │ Nerve ring               │ Cross-attention entre bottlenecks   │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Brazo desconectado funcional      │ Módulo con FF loss local │ Opera sin coordinador               │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Cerebro modula atención por brazo │ Atención dinámica        │ Pesos α_i por input                 │
+  ├───────────────────────────────────┼──────────────────────────┼─────────────────────────────────────┤
+  │ Comandos globales via CBT         │ Feedback top-down        │ Vector f_i modula activaciones      │
+  └───────────────────────────────────┴──────────────────────────┴─────────────────────────────────────┘
+5. EXPERIMENTOS
+
+5.1 Diseño Experimental
+
+  Evaluamos OctopusNet mediante cinco experimentos principales que comparan nuestra arquitectura contra baselines relevantes:
+  ┌─────┬─────────────────────────────┬──────────────────────────────────────────────────────┐
+  │ Exp │           Nombre            │                     Descripción                      │
+  ├─────┼─────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ 1   │ Baseline centralizado       │ Red CNN tradicional con backprop global              │
+  ├─────┼─────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ 2   │ OctopusNet + Backprop local │ Nuestra arquitectura pero con backprop en vez de FF  │
+  ├─────┼─────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ 3   │ OctopusNet + FF puro        │ Nuestra arquitectura con Forward-Forward             │
+  ├─────┼─────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ 4   │ OctopusNet híbrido          │ FF entre módulos, backprop dentro de cada módulo     │
+  ├─────┼─────────────────────────────┼──────────────────────────────────────────────────────┤
+  │ 5   │ Federated Learning (FedAvg) │ N clientes con copias del modelo, promediado central │
+  └─────┴─────────────────────────────┴──────────────────────────────────────────────────────┘
+  El experimento 4 (híbrido) es nuestra configuración recomendada, basada en evidencia de que este enfoque puede superar a backprop puro (SFF, 2025).
+
+5.2 Datasets
+  ┌───────────────┬────────┬──────────┬────────────┬─────────────────────┐
+  │    Dataset    │ Clases │ Imágenes │ Resolución │      Propósito      │
+  ├───────────────┼────────┼──────────┼────────────┼─────────────────────┤
+  │ MNIST         │ 10     │ 70,000   │ 28×28      │ Validación inicial  │
+  ├───────────────┼────────┼──────────┼────────────┼─────────────────────┤
+  │ Fashion-MNIST │ 10     │ 70,000   │ 28×28      │ Complejidad media   │
+  ├───────────────┼────────┼──────────┼────────────┼─────────────────────┤
+  │ CIFAR-10      │ 10     │ 60,000   │ 32×32      │ Benchmark principal │
+  ├───────────────┼────────┼──────────┼────────────┼─────────────────────┤
+  │ CIFAR-100     │ 100    │ 60,000   │ 32×32      │ Escalabilidad       │
+  └───────────────┴────────┴──────────┴────────────┴─────────────────────┘
+5.3 Configuración de OctopusNet
+
+  Configuración por defecto para los experimentos:
+  ┌───────────────────┬───────────────────┬─────────────────────────────────────────────┐
+  │     Parámetro     │       Valor       │                  Notas                     │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ N (módulos)       │ 4                 │ Kernel 3×3 todos, resoluciones: 32,16,8,4   │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ B (bottleneck)    │ 64                │ Óptimo empírico: sep=1.227 vs sep=0.949 (B=32) │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Capas por módulo  │ 3                 │ Conv con 64, 128, 256 filtros               │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Goodness function │ Global mean (f3²) │ (f3**2).mean(), LayerNorm entre capas conv  │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Label embedding   │ Fourier K=0.5     │ Patrones sinusoidales únicos por clase      │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Threshold         │ Adaptativo        │ θ = (g_pos.mean() + g_neg.mean()) / 2       │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Agregación        │ Atención dinámica │ Softmax sobre scores                        │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Augmentation      │ RandomCrop+HFlip  │ RandomCrop(32,pad=4), RandomHorizontalFlip  │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Optimizador       │ Adam              │ lr=0.001                                    │
+  ├───────────────────┼───────────────────┼─────────────────────────────────────────────┤
+  │ Epochs            │ 100               │ Early stopping con paciencia 10             │
+  └───────────────────┴───────────────────┴─────────────────────────────────────────────┘
+5.4 Métricas
+  ┌────────────────────────────┬────────────────────────────────────────────────┐
+  │          Métrica           │                    Qué mide                    │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ Accuracy (%)               │ Clasificación correcta en test set             │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ Comunicación (bytes/epoch) │ Datos transferidos entre módulos y coordinador │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ Resiliencia (%)            │ Accuracy cuando 1, 2, o 3 módulos fallan       │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ Tiempo de entrenamiento    │ Segundos por epoch                             │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ Parámetros totales         │ Tamaño del modelo                              │
+  └────────────────────────────┴────────────────────────────────────────────────┘
+5.5 Experimentos de Ablación
+
+  Para entender el impacto de cada componente:
+  ┌──────────┬───────────────────┬───────────────────────────────────┐
+  │ Ablación │     Variable      │         Valores a probar          │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A1       │ Número de módulos │ 2, 4, 8, 16                       │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A2       │ Tamaño bottleneck │ 8, 16, 32, 64, 128                │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A3       │ Capas por módulo  │ 2, 3, 4, 5                        │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A4       │ Goodness function │ 5 variantes del benchmark 2025    │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A5       │ Agregación        │ Concatenación, Promedio, Atención │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A6       │ Resiliencia       │ Desconectar 1, 2, 3, N-1 módulos  │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A7       │ Feedback top-down │ Con feedback vs sin feedback      │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A8       │ Nerve ring        │ Con vs sin comunicación lateral   │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A9       │ Módulos heterog.  │ Solo CNNs vs CNN+Transformer+RNN  │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A10      │ Competición GWT   │ Soft vs Gumbel-hard vs Top-K      │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A11      │ Threshold adapt.  │ Fijo (2.0) vs adaptativo          │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A12a     │ Kernels           │ k=3×3 (default) vs adaptativos    │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A12b     │ Multi-escala      │ [32,16,8,4] (default) vs res fija │
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A13      │ Label embedding   │ One-hot píxeles vs Fourier espacial│
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A14      │ Goodness function │ sum(h²) global vs ASGE por patches│
+  ├──────────┼───────────────────┼───────────────────────────────────┤
+  │ A15      │ Channel grouping  │ x_pos/x_neg vs agrupación canales │
+  └──────────┴───────────────────┴───────────────────────────────────┘
+5.6 Comparación Directa: OctopusNet vs Federated Learning
+
+  Este experimento es clave para responder a la pregunta de cómo difiere OctopusNet de FL:
+  ┌──────────────┬─────────────────────────────────┬────────────────────────────────┐
+  │   Aspecto    │           OctopusNet            │             FedAvg             │
+  ├──────────────┼─────────────────────────────────┼────────────────────────────────┤
+  │ Nodos        │ 4 módulos diferentes            │ 4 clientes con modelo idéntico │
+  ├──────────────┼─────────────────────────────────┼────────────────────────────────┤
+  │ Comunicación │ 4 × 32 = 128 floats             │ Modelo completo × 4            │
+  ├──────────────┼─────────────────────────────────┼────────────────────────────────┤
+  │ Agregación   │ Atención sobre representaciones │ Promedio de pesos              │
+  ├──────────────┼─────────────────────────────────┼────────────────────────────────┤
+  │ Rondas       │ Cada batch                      │ Cada K epochs locales          │
+  └──────────────┴─────────────────────────────────┴────────────────────────────────┘
+  Medimos: accuracy final, bytes totales transmitidos, y degradación cuando un nodo falla.
+
+5.7 Resultados
+
+  5.7.1 Resultados Baseline (Configuración inicial, lr=0.001, 10 épocas)
+
+  Tabla A9 - Homogéneo vs Heterogéneo (CIFAR-10):
+  ┌─────────────────────────────┬──────────┬────────┬──────────────────────────────────────────────────┐
+  │       Configuración         │ Best Acc │ Épocas │                     Notas                        │
+  ├─────────────────────────────┼──────────┼────────┼──────────────────────────────────────────────────┤
+  │ Homogéneo v1 (sin LayerNorm)│ 23.02%   │ 10     │ Kernels 3×3/5×5/7×7/9×9, misma res — OBSOLETO   │
+  ├─────────────────────────────┼──────────┼────────┼──────────────────────────────────────────────────┤
+  │ Homogéneo v2 (con LayerNorm)│ 48.42%   │ 50     │ 4 CNNs k=3×3, res [32,16,8,4], best época 26    │
+  ├─────────────────────────────┼──────────┼────────┼──────────────────────────────────────────────────┤
+  │ Homogéneo v3 (bn=64 + aug)  │ 51.83%   │ 100    │ bottleneck=64, RandomCrop+HFlip, best época 96   │
+  ├─────────────────────────────┼──────────┼────────┼──────────────────────────────────────────────────┤
+  │ Heterogéneo (CNN+Trans+LSTM)│ 47.39%   │ 30     │ res [32,16,8,4], best época 28, ReduceLROnPlateau│
+  └─────────────────────────────┴──────────┴────────┴──────────────────────────────────────────────────┘
+
+  Progresión por época (Heterogéneo, CIFAR-10):
+  ┌───────┬──────────┬─────────────────────────────────────────────────────────────────┐
+  │ Época │ Test Acc │                          Observación                            │
+  ├───────┼──────────┼─────────────────────────────────────────────────────────────────┤
+  │ 1     │ 28.18%   │ Inicio fuerte (+10% vs homogéneo)                               │
+  │ 2     │ 31.41%   │ ↑ BEST                                                          │
+  │ 3     │ 30.19%   │ ↓ Ligera caída                                                  │
+  │ 4     │ 29.67%   │ ↓ Continúa bajando                                              │
+  │ 5     │ 29.40%   │ ↓ Estabiliza                                                    │
+  │ 6     │ 26.58%   │ ↓ Caída fuerte                                                  │
+  │ 7     │ 22.27%   │ ↓ Mínimo                                                        │
+  │ 8     │ 29.36%   │ ↑ Recupera                                                      │
+  │ 9     │ 27.42%   │ ↓ Oscila                                                        │
+  │ 10    │ 25.77%   │ ↓ Final                                                         │
+  └───────┴──────────┴─────────────────────────────────────────────────────────────────┘
+
+  Hallazgo A9: Los módulos heterogéneos logran +8% mejor accuracy pico (31.41% vs 23.02%),
+  indicando que CNN+Transformer+LSTM capturan features complementarias. Sin embargo,
+  muestran mayor inestabilidad durante el entrenamiento. Esto sugiere que se beneficiarían
+  de: (1) learning rate más bajo, (2) más épocas, o (3) mejor regularización.
+
+  NOTA: Estos son resultados baseline (lr=0.001, 10 épocas). Se planea una fase de
+  optimización con lr=0.0003 y 20+ épocas para mejorar convergencia.
+
+  Progresión por época (Homogéneo, CIFAR-10):
+  ┌───────┬──────────┬─────────────────────────────────────────────────────────────────┐
+  │ Época │ Test Acc │                          Observación                            │
+  ├───────┼──────────┼─────────────────────────────────────────────────────────────────┤
+  │ 1     │ 18.61%   │ Inicio                                                          │
+  │ 2     │ 20.18%   │ ↑ Mejora                                                        │
+  │ 3     │ 21.01%   │ ↑ Mejora                                                        │
+  │ 4     │ 18.81%   │ ↓ Oscilación (normal en FF)                                     │
+  │ 5     │ 21.69%   │ ↑ Recupera                                                      │
+  │ 6     │ 22.16%   │ ↑ Mejora                                                        │
+  │ 7     │ 22.44%   │ ↑ Mejora                                                        │
+  │ 8     │ 23.02%   │ ↑ BEST                                                          │
+  │ 9     │ 21.71%   │ ↓ Oscilación                                                    │
+  │ 10    │ 21.58%   │ ↓ Final                                                         │
+  └───────┴──────────┴─────────────────────────────────────────────────────────────────┘
+
+  Nota: La oscilación es característica del Forward-Forward. Se planea optimizar
+  con lr=0.0003 y más épocas para reducir varianza.
+
+  Progresión por época (Homogéneo v3, bn=64 + augmentation, CIFAR-10):
+  ┌───────┬──────────┬─────────────────────────────────────────────────────────────────┐
+  │ Época │ Test Acc │                          Observación                            │
+  ├───────┼──────────┼─────────────────────────────────────────────────────────────────┤
+  │ 1     │ 35.56%   │ Inicio más lento — augmentation dificulta primeras épocas        │
+  │ 10    │ 45.83%   │ Comparable con v2 en misma época                                │
+  │ 20    │ 47.90%   │ ↑ Ya supera v2 baseline                                         │
+  │ 37    │ 50.36%   │ ↑ Primer cruce de 50%                                           │
+  │ 50    │ 50.61%   │ ↑ BEST (primera fase)                                           │
+  │ 65    │ 51.19%   │ ↑ Sigue mejorando lentamente                                    │
+  │ 81    │ 51.66%   │ ↑ Nuevo máximo                                                  │
+  │ 96    │ 51.83%   │ ↑ BEST GLOBAL                                                   │
+  │ 100   │ 50.20%   │ Oscilación final — plateau confirmado                           │
+  └───────┴──────────┴─────────────────────────────────────────────────────────────────┘
+
+  Hallazgo v3: bottleneck=64 + data augmentation (RandomCrop, RandomHorizontalFlip) mejora
+  48.42% → 51.83% (+3.41%). La curva sigue subiendo hasta época 96 sin plateau claro —
+  augmentation previene sobreajuste. El techo estimado de esta configuración es ~52%,
+  consistente con la limitación de capacidad del coordinador (4×64=256 features para 10 clases).
+
+  Observación empírica sobre pesos de atención - Redundancia de kernels homogéneos (CIFAR-10):
+
+  Durante el diagnóstico del modelo homogéneo (4 CNNs con kernels 3×3, 5×5, 7×7, 9×9
+  sobre la misma resolución 32×32), el coordinador aprendió a asignar pesos de atención
+  altamente no uniformes en la primera época:
+
+  ┌──────────────────────────────┬────────────┬──────────────────────────────────────────┐
+  │          Módulo              │  Atención  │              Interpretación              │
+  ├──────────────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ M1: CNN 3×3  (RF=7×7)        │   0.596    │ Bordes finos, texturas locales           │
+  ├──────────────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ M2: CNN 5×5  (RF=13×13)      │   0.006    │ Redundante — interpolación de M1 y M4   │
+  ├──────────────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ M3: CNN 7×7  (RF=19×19)      │   0.046    │ Redundante — interpolación de M1 y M4   │
+  ├──────────────────────────────┼────────────┼──────────────────────────────────────────┤
+  │ M4: CNN 9×9  (RF=25×25)      │   0.352    │ Contexto global, formas grandes          │
+  └──────────────────────────────┴────────────┴──────────────────────────────────────────┘
+
+  El coordinador descubrió de forma autónoma, mediante backprop en una sola época, que
+  los módulos intermedios (k=5, k=7) no aportan información ortogonal a los extremos
+  (k=3, k=9) cuando todos operan sobre la misma imagen 32×32. La atención es de facto
+  un "winner-takes-two": M1 y M4 dominan, M2 y M3 son ignorados.
+
+  Este resultado es evidencia empírica directa del problema de redundancia de kernels
+  sobre resolución fija: aumentar el tamaño del kernel no garantiza diversidad de
+  información si la resolución de entrada es la misma. Los campos receptivos intermedios
+  (RF=13×13, RF=19×19) capturan superposiciones de lo que ya extraen los extremos.
+
+  Hallazgo A1-obs: En configuración homogénea (misma resolución), el coordinador
+  converge a una solución de dos módulos efectivos independientemente del número de
+  kernels intermedios disponibles. Esto motiva directamente el experimento A12b
+  (multi-escala): si cada módulo recibe una resolución diferente, la información
+  capturada es genuinamente complementaria y el coordinador debería distribuir la
+  atención más uniformemente.
+
+  Hipótesis testeable (A12b): Con entradas multi-escala [32, 16, 8, 4] por módulo,
+  la desviación estándar de los pesos de atención debería disminuir significativamente
+  (de std≈0.278 en homogéneo a std<0.1), indicando que todos los módulos contribuyen
+  de forma balanceada porque cada uno posee información irreducible al resto.
+
+  5.7.2 Experimento A6: Resiliencia ante Fallos de Módulos (CIFAR-10)
+
+  Modelo: Homogéneo v3 (bn=64, augmentation, 100 épocas). Checkpoint: época 96, 51.83%.
+  Método: módulo fallido → forward reemplazado por ceros; coordinador redistribuye atención automáticamente.
+  Baseline ResNet equivalente ante fallo interno: ~10% (colapso total, random).
+
+  Fallo de 1 módulo:
+  ┌─────────────────┬──────────┬──────────┬────────────────────────────────────────────┐
+  │ Módulo fallido  │ Accuracy │  Caída   │              Interpretación                │
+  ├─────────────────┼──────────┼──────────┼────────────────────────────────────────────┤
+  │ Ninguno (base)  │ 50.20%   │  —       │ Todos los módulos funcionando              │
+  ├─────────────────┼──────────┼──────────┼────────────────────────────────────────────┤
+  │ M4 (res=4×4)    │ 45.41%   │ -4.79%   │ Más prescindible — contexto global         │
+  ├─────────────────┼──────────┼──────────┼────────────────────────────────────────────┤
+  │ M3 (res=8×8)    │ 41.37%   │ -8.83%   │ Moderadamente importante                   │
+  ├─────────────────┼──────────┼──────────┼────────────────────────────────────────────┤
+  │ M1 (res=32×32)  │ 34.51%   │ -15.69%  │ Importante — detalles finos               │
+  ├─────────────────┼──────────┼──────────┼────────────────────────────────────────────┤
+  │ M2 (res=16×16)  │ 13.89%   │ -36.31%  │ Crítico — cuello de botella entre escalas  │
+  └─────────────────┴──────────┴──────────┴────────────────────────────────────────────┘
+
+  Fallo de 2 módulos:
+  ┌──────────────┬──────────┬──────────┬─────────────────────────────────────────────────┐
+  │ Módulos      │ Accuracy │  Caída   │              Interpretación                     │
+  ├──────────────┼──────────┼──────────┼─────────────────────────────────────────────────┤
+  │ M3+M4        │ 34.05%   │ -16.15%  │ Solo escala fina+media — funciona razonablemente│
+  ├──────────────┼──────────┼──────────┼─────────────────────────────────────────────────┤
+  │ M1+M4        │ 33.00%   │ -17.20%  │ Solo escalas intermedias — aún funcional        │
+  ├──────────────┼──────────┼──────────┼─────────────────────────────────────────────────┤
+  │ M1+M3        │ 30.29%   │ -19.91%  │ Solo M2+M4 — degradado pero funcional           │
+  ├──────────────┼──────────┼──────────┼─────────────────────────────────────────────────┤
+  │ M2+M4        │ 11.58%   │ -38.62%  │ Sin escala media — casi colapso                 │
+  ├──────────────┼──────────┼──────────┼─────────────────────────────────────────────────┤
+  │ M1+M2        │ 10.38%   │ -39.82%  │ Sin escalas fina+media — colapso               │
+  ├──────────────┼──────────┼──────────┼─────────────────────────────────────────────────┤
+  │ M2+M3        │ 10.01%   │ -40.19%  │ Sin escalas intermedias — colapso               │
+  └──────────────┴──────────┴──────────┴─────────────────────────────────────────────────┘
+
+  Fallo de 3 módulos (solo 1 superviviente):
+  ┌──────────────────┬──────────┬──────────┬──────────────────────────────────────────────┐
+  │ Superviviente    │ Accuracy │  Caída   │              Interpretación                  │
+  ├──────────────────┼──────────┼──────────┼──────────────────────────────────────────────┤
+  │ Solo M4 (res=4)  │ 28.80%   │ -21.40%  │ Contexto global solo — 2.88× mejor que random│
+  ├──────────────────┼──────────┼──────────┼──────────────────────────────────────────────┤
+  │ Solo M1 (res=32) │ 10.32%   │ -39.88%  │ Detalles finos solos — casi random           │
+  ├──────────────────┼──────────┼──────────┼──────────────────────────────────────────────┤
+  │ Solo M2 (res=16) │ 10.00%   │ -40.20%  │ Colapso — M2 solo no clasifica              │
+  ├──────────────────┼──────────┼──────────┼──────────────────────────────────────────────┤
+  │ Solo M3 (res=8)  │ 10.00%   │ -40.20%  │ Colapso — M3 solo no clasifica              │
+  └──────────────────┴──────────┴──────────┴──────────────────────────────────────────────┘
+
+  Hallazgo A6:
+
+  1. **Graceful degradation confirmada**: con 1 módulo caído, OctopusNet mantiene 68-90%
+     de su accuracy original. ResNet equivalente colapsa a ~10% (random) con cualquier
+     fallo interno. La diferencia es estructural — OctopusNet no tiene un punto único de fallo.
+
+  2. **Especialización no uniforme**: M2 (res=16) es el módulo más crítico — su pérdida
+     causa una caída de 36.31%. Esto confirma que los módulos capturan información
+     genuinamente diferente y no redundante. Si fueran redundantes, perder cualquiera
+     daría la misma caída.
+
+  3. **M4 (res=4) más robusto individualmente**: con solo M4 activo el sistema alcanza
+     28.80% — 2.88× mejor que random. El contexto global (4×4) contiene más información
+     clasificable por sí solo que los detalles finos.
+
+  4. **Patrón de colapso**: el sistema colapsa cuando M2 está entre los fallidos (todos
+     los combos con M2 caen a ~10%). M2 actúa como "traductor" entre la escala fina
+     (M1) y las escalas gruesas (M3, M4).
+
+  5.7.3 Experimento A6b: Module Dropout + Channel Grouping — Resiliencia Óptima
+
+  Motivación: A18b demostró que Channel Grouping eleva accuracy a 64.17% pero el floor de
+  resiliencia (41.47%) es comparable al FF estándar. A6b combina CG con Module Dropout
+  (p=0.5 por batch) para determinar si ambas técnicas son complementarias.
+
+  Método: Misma arquitectura que A18b (4 CGCNNModules, kernels [3,5,7,9], NerveRing +
+  Coordinator). Durante entrenamiento del coordinador, con probabilidad p=0.5 se elige un
+  módulo aleatorio y se reemplaza su salida por ceros para ese batch. Los módulos CG se
+  entrenan normalmente con ff_loss local. MultiStepLR: milestones=[10,20,27], gamma=0.1.
+  30 épocas. Checkpoint guardado en Drive al mejor val_acc.
+
+  Relación con literatura: análogo a Dropout (Srivastava et al., 2014) pero a nivel de módulo
+  completo; similar a Stochastic Depth (Huang et al., 2016) pero sobre módulos paralelos FF
+  con coordinador de atención. Combinación con channel grouping no existe en literatura.
+
+  Resultados — fallo de módulo individual:
+  ┌──────────────────────┬──────────┬──────────┬──────────┐
+  │ Escenario            │  A18b    │  A6b     │  Mejora  │
+  ├──────────────────────┼──────────┼──────────┼──────────┤
+  │ Full system          │  64.17%  │  64.34%  │  +0.17%  │
+  ├──────────────────────┼──────────┼──────────┼──────────┤
+  │ M0 falla (kernel 3)  │    -     │  61.12%  │    -     │
+  ├──────────────────────┼──────────┼──────────┼──────────┤
+  │ M1 falla (kernel 5)  │    -     │  62.85%  │    -     │
+  ├──────────────────────┼──────────┼──────────┼──────────┤
+  │ M2 falla (kernel 7)  │    -     │  61.64%  │    -     │
+  ├──────────────────────┼──────────┼──────────┼──────────┤
+  │ M3 falla (kernel 9)  │  41.47%* │  62.20%  │ +20.73%  │
+  ├──────────────────────┼──────────┼──────────┼──────────┤
+  │ Floor (peor caso)    │  41.47%  │  61.12%  │ +19.65%  │
+  └──────────────────────┴──────────┴──────────┴──────────┘
+  *A18b reportó solo peor caso; A6b reporta todos los módulos.
+
+  Resultados — fallo de dos módulos simultáneos:
+  ┌─────────────────┬──────────┐
+  │ Combo           │  A6b     │
+  ├─────────────────┼──────────┤
+  │ M0+M1 fallan    │  57.11%  │
+  ├─────────────────┼──────────┤
+  │ M0+M2 fallan    │  56.19%  │
+  ├─────────────────┼──────────┤
+  │ M0+M3 fallan    │  56.82%  │
+  ├─────────────────┼──────────┤
+  │ M1+M2 fallan    │  58.11%  │
+  ├─────────────────┼──────────┤
+  │ M1+M3 fallan    │  58.71%  │
+  ├─────────────────┼──────────┤
+  │ M2+M3 fallan    │  52.87%  │
+  ├─────────────────┼──────────┤
+  │ Floor           │  52.87%  │
+  └─────────────────┴──────────┘
+
+  Hallazgo A6b:
+
+  1. **Resiliencia uniforme y alta**: con CG+ModDrop, ningún módulo es punto de falla
+     catastrófico. El floor de single-failure sube de 41.47% (A18b) a 61.12% — el sistema
+     garantiza >61% de accuracy ante cualquier fallo simple. Degradación máxima: −3.22 pts.
+
+  2. **Doble fallo cubierto**: ante fallo simultáneo de dos módulos (50% de los módulos),
+     el sistema mantiene mínimo 52.87%. Sin ModDrop (A18b) el peor caso doble era ~22%.
+
+  3. **Sin costo en accuracy normal**: A6b alcanza 64.34% vs 64.17% de A18b (+0.17%).
+     Module Dropout no penaliza accuracy — la mejora de resiliencia es completamente gratuita.
+
+  4. **Complementariedad CG + ModDrop**: Channel Grouping provee accuracy; Module Dropout
+     provee resiliencia distribuida. Las dos técnicas son ortogonales y se potencian.
+     A6b es la configuración óptima: máximo accuracy + máxima resiliencia.
+
+  5.7.4 Experimento A8: Nerve Ring Ablation (CIFAR-10)
+
+  Pregunta: ¿el nerve ring (cross-attention lateral entre módulos) aporta accuracy
+  sobre el coordinador solo?
+
+  Método: dos modelos idénticos (bn=64, 4 CNNs multiscale, 50 épocas), único cambio:
+  `use_nerve_ring=True` vs `use_nerve_ring=False`.
+
+  Resultados:
+  ┌─────────────────────┬──────────┬───────────────────────────────────────────┐
+  │ Configuración       │ Accuracy │ Notas                                     │
+  ├─────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ Con Nerve Ring      │  51.45%  │ Cross-attention lateral entre módulos     │
+  ├─────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ Sin Nerve Ring      │  51.38%  │ Coordinador directo sin comunicación lat. │
+  └─────────────────────┴──────────┴───────────────────────────────────────────┘
+  Impacto: +0.07% — diferencia no significativa (ruido de inicialización).
+
+  Hallazgo A8:
+
+  El nerve ring no aporta accuracy measurable en CIFAR-10. El coordinador con atención
+  dinámica ya captura las relaciones entre módulos sin necesitar comunicación lateral
+  explícita. El nerve ring añade parámetros y cómputo (~12% overhead) sin beneficio
+  en esta tarea.
+
+  Interpretación: CIFAR-10 es suficientemente simple para que el coordinador infiera
+  relaciones inter-módulo directamente desde los bottlenecks. La hipótesis es que el
+  nerve ring sería más valioso en tareas donde la comunicación lateral importa más:
+  CIFAR-100, datasets multimodales, o inputs con dependencias espaciales complejas.
+
+  5.7.5 Experimento A17: Nerve Ring Iterativo (Rondas de Negociación)
+
+  Pregunta: ¿múltiples rondas de cross-attention en el nerve ring mejoran la
+  coordinación entre módulos y el accuracy final?
+
+  Motivación: el nerve ring estándar aplica una sola ronda de cross-attention.
+  La hipótesis es que N rondas permitirían "negociación iterativa" entre módulos
+  antes de enviar al coordinador — análogo a ciclos de procesamiento recurrente
+  en corteza visual (Lamme & Roelfsema, 2000).
+
+  Método: se entrena un base checkpoint con CGCNNModule (4 módulos, kernels
+  [3,5,7,9], 10 épocas, bottleneck=64, val_acc=62.49%). Desde ese checkpoint
+  se fine-tunea solo el coordinador + IterativeNerveRing (módulos congelados,
+  lr=1e-3, 10 épocas) para rounds ∈ {1, 2, 3}. Métricas adicionales:
+
+  - cosine_divergence: distancia coseno media entre pares de bottlenecks
+    (mayor = más especializados)
+  - attn_entropy: entropía de los pesos de atención del nerve ring
+    (menor = más selectivo)
+  - round_delta: norma del cambio en bottlenecks por ronda
+
+  Resultados:
+  ┌────────┬──────────┬─────────────┬─────────┬──────────────────────┐
+  │ Rounds │ Accuracy │  Divergence │ Entropy │ Deltas por ronda     │
+  ├────────┼──────────┼─────────────┼─────────┼──────────────────────┤
+  │   1    │  63.91%  │   1.0266    │  1.3565 │ [2.79]               │
+  ├────────┼──────────┼─────────────┼─────────┼──────────────────────┤
+  │   2    │  63.69%  │   0.9827    │  1.3767 │ [2.44, 1.59]         │
+  ├────────┼──────────┼─────────────┼─────────┼──────────────────────┤
+  │   3    │  63.70%  │   0.9472    │  1.3698 │ [2.27, 1.23, 1.25]   │
+  └────────┴──────────┴─────────────┴─────────┴──────────────────────┘
+
+  Hallazgo A17:
+
+  Más rondas de cross-attention no mejoran accuracy — de hecho lo degradan
+  marginalmente (rounds=2: −0.22%, rounds=3: −0.21% vs rounds=1). Los
+  indicadores de representación confirman por qué:
+
+  1. Divergence decrece con cada ronda (1.0266 → 0.9472): las representaciones
+     se homogenizan. El cross-attention mezcla las perspectivas especializadas
+     de cada CGCNNModule en lugar de enriquecerlas.
+
+  2. Round deltas decrecen rápidamente (2.79 → 1.59 → 1.25): la red converge
+     en la primera ronda. Las rondas adicionales mueven poco — la información
+     relevante ya fue intercambiada.
+
+  3. Entropy casi constante: el coordinador no se vuelve más selectivo con
+     más rondas.
+
+  Interpretación: CGCNNModule produce representaciones altamente especializadas
+  por estructura (canal→clase). El nerve ring con 1 ronda es suficiente para
+  que cada módulo consulte a los demás. Rondas adicionales promedian
+  representaciones que el coordinador necesita distintas para tomar una
+  decisión informada. La especialización viene de la arquitectura del módulo,
+  no del protocolo de comunicación lateral.
+
+  Conclusión: rounds=1 es óptimo con CGCNNModule. IterativeNerveRing no aporta
+  en esta configuración.
+
+  5.7.6 Experimento: Resiliencia CNN Baseline (Comparación)
+
+  Método: CNN secuencial entrenada con backprop, misma tarea (CIFAR-10). Fallo simulado
+  zeroing el output de cada bloque convolucional. CNN tiene 3 bloques secuenciales —
+  si un bloque falla, los siguientes reciben ceros en cascada.
+
+  Resultados:
+  ┌──────────────────┬──────────┬──────────────────────────────────────────────────┐
+  │ Escenario        │ Accuracy │ Interpretación                                   │
+  ├──────────────────┼──────────┼──────────────────────────────────────────────────┤
+  │ Sin fallo        │  90.96%  │ Baseline normal                                  │
+  ├──────────────────┼──────────┼──────────────────────────────────────────────────┤
+  │ Bloque 1 fallido │  10.00%  │ Colapso total — falla se propaga en cascada      │
+  ├──────────────────┼──────────┼──────────────────────────────────────────────────┤
+  │ Bloque 2 fallido │  10.00%  │ Colapso total — falla se propaga en cascada      │
+  ├──────────────────┼──────────┼──────────────────────────────────────────────────┤
+  │ Bloque 3 fallido │  10.00%  │ Colapso total — falla se propaga en cascada      │
+  └──────────────────┴──────────┴──────────────────────────────────────────────────┘
+
+  Comparación directa OctopusNet vs CNN ante falla crítica:
+  ┌──────────────────────────────┬──────────┬───────────────┬─────────────────────┐
+  │ Sistema                      │ Accuracy │ Falla crítica │ Resiliencia         │
+  ├──────────────────────────────┼──────────┼───────────────┼─────────────────────┤
+  │ CNN backprop                 │  90.96%  │    10.00%     │ 0% — colapso total  │
+  ├──────────────────────────────┼──────────┼───────────────┼─────────────────────┤
+  │ OctopusNet FF                │  52.50%  │    41.72%     │ 79% del baseline    │
+  ├──────────────────────────────┼──────────┼───────────────┼─────────────────────┤
+  │ OctopusNet A18b (CG + BP)    │  64.17%  │    41.47%     │ 65% del baseline    │
+  ├──────────────────────────────┼──────────┼───────────────┼─────────────────────┤
+  │ OctopusNet A6b (CG + ModDrop)│  64.34%  │    61.12%     │ 95% del baseline    │
+  └──────────────────────────────┴──────────┴───────────────┴─────────────────────┘
+
+  CNN sacrifica toda resiliencia por accuracy. OctopusNet A6b retiene 95% de accuracy
+  ante fallo de cualquier módulo individual. Module Dropout + Channel Grouping combinados
+  son la configuración óptima: sin tradeoff entre accuracy normal y resiliencia.
+
+  5.7.7 Experimento A15b: SFF Auxiliary Classifiers — Sistema 100% Local
+
+  Motivación: el coordinador con backprop representa una tensión teórica — módulos usan
+  aprendizaje local (FF) pero el coordinador usa backpropagation global. A15b resuelve
+  esto: cada módulo tiene un clasificador auxiliar local (SFF-style) y el coordinador
+  solo promedia o pondera predicciones ya hechas, sin backprop global.
+
+  Método (inspirado en Krutsylo, arXiv:2501.03176, 2025):
+  - Cada módulo CNN → f3 → AuxClassifier(Conv→pool→Linear) → logits locales
+  - AuxClassifier entrenado con CrossEntropy + detach() — no backpropaga a módulos FF
+  - LogitCoordinator: Linear(40,4)+softmax sobre logits concatenados → pesos de atención
+  - Módulos FF: entrenados con Forward-Forward (sin cambios)
+  - Sistema completamente sin backprop global
+
+  Resultados (50 épocas, CIFAR-10):
+  ┌────────────────────────────────┬──────────┬───────────────────────────────────────┐
+  │ Configuración                  │ Accuracy │ Notas                                 │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ M1 solo (res=32)               │  44.43%  │ Módulo individual con aux classifier  │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ M2 solo (res=16)               │  48.09%  │ Mejor módulo individual               │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ M3 solo (res=8)                │  47.00%  │ Módulo individual con aux classifier  │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ M4 solo (res=4)                │  38.18%  │ Peor individual — contexto solo débil │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ Promedio simple (ensemble)     │  53.59%  │ Sin pesos, sin aprendizaje            │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ Coord atención (100% local)    │  53.16%  │ Pesos aprendidos, sin backprop global │
+  ├────────────────────────────────┼──────────┼───────────────────────────────────────┤
+  │ OctopusNet v3 + coord backprop │  52.50%  │ Referencia — coordinador con backprop │
+  └────────────────────────────────┴──────────┴───────────────────────────────────────┘
+
+  Hallazgo A15b:
+
+  1. **Sistema 100% local supera sistema con backprop**: coord atención 53.16% vs
+     coord backprop 52.50% (+0.66%). Eliminar backprop del coordinador no degrada
+     el accuracy — el cuello de botella nunca fue el coordinador.
+
+  2. **Promedio simple > atención dinámica**: promedio simple 53.59% vs coord atención 53.16%
+     (-0.43%). Los módulos bien calibrados con FF son suficientemente complementarios que
+     promediarlos supera levemente al coordinador aprendido. La atención dinámica no añade
+     valor encima del ensemble simple.
+
+  3. **M4 (res=4) es consistentemente el más débil individualmente** (38.18%) pero
+     aporta al ensemble — el contexto global solo no clasifica bien, pero complementa
+     a los módulos de mayor resolución.
+
+  4. **Combinación multi-escala es la clave**: módulos individuales 38-48%, ensemble
+     53.59% — la ganancia de +5-15% viene de combinar escalas, no de la arquitectura
+     del coordinador.
+
+  Pesos de atención aprendidos (promedio sobre test set):
+  ┌─────────────────┬────────┬──────────────────────────────────────────────────┐
+  │ Módulo          │  Peso  │ Interpretación                                   │
+  ├─────────────────┼────────┼──────────────────────────────────────────────────┤
+  │ M1 (res=32)     │ 0.363  │ Mayor confianza — detalles finos más informativos │
+  ├─────────────────┼────────┼──────────────────────────────────────────────────┤
+  │ M2 (res=16)     │ 0.341  │ Segunda — escala media bien calibrada            │
+  ├─────────────────┼────────┼──────────────────────────────────────────────────┤
+  │ M3 (res=8)      │ 0.188  │ Menor confianza — escala gruesa                  │
+  ├─────────────────┼────────┼──────────────────────────────────────────────────┤
+  │ M4 (res=4)      │ 0.108  │ Mínima — contexto global solo débil (38.79%)     │
+  └─────────────────┴────────┴──────────────────────────────────────────────────┘
+  M1+M2 acumulan 0.704 del peso total — el coordinador aprendió a preferir
+  resoluciones altas, consistente con que M4 es el módulo individual más débil.
+  Los pesos no son uniformes (≠0.25) — el algoritmo de atención discrimina
+  correctamente aunque la mejora sobre promedio simple sea marginal (+0.06%).
+
+  Implicación para la arquitectura: OctopusNet puede funcionar completamente sin
+  backprop global. Esto fortalece la narrativa de aprendizaje distribuido y local,
+  y hace el sistema más adecuado para entornos donde la comunicación de gradientes
+  no es posible.
+
+  5.7.8 Experimento A18b: Channel Grouping en OctopusNet (Ortiz Torres et al.)
+
+  Motivación: Ortiz Torres et al. (arXiv:2504.21662, 2025) proponen channel grouping
+  como alternativa al FF estándar: dividir los filtros CNN en J grupos (uno por clase),
+  donde cada grupo computa su propia goodness score. No se necesitan imágenes negativas
+  externas — la competencia ocurre entre grupos de canales dentro del mismo forward pass.
+
+  Método:
+  - CGCNNModule: Conv2d(3, 160, k) seguido de Conv2d(160, 160, k, groups=10)
+    donde 160 = 10 clases × 16 canales por grupo
+  - FF loss: softplus(-g_target + θ) + softplus(g_wrong - θ)
+    donde g_target = goodness del grupo de la clase correcta,
+    g_wrong = goodness promedio de los 9 grupos incorrectos
+  - 4 CGCNNModules con kernels [3,5,7,9] — misma configuración heterogénea que baseline
+  - Nerve ring y coordinator: idénticos al baseline (sin cambios)
+  - MultiStep LR: milestones=[10,20,27], gamma=0.1
+  - 30 épocas, batch=128, CIFAR-10
+
+  Resultados:
+
+  ┌────────────────────────────────────┬──────────┬──────────────────────────────────┐
+  │ Configuración                      │ Accuracy │ Notas                            │
+  ├────────────────────────────────────┼──────────┼──────────────────────────────────┤
+  │ A18 (CGCNNModule solo, 20 epochs)  │  49.22%  │ Un módulo, sin coordinador       │
+  ├────────────────────────────────────┼──────────┼──────────────────────────────────┤
+  │ OctopusNet FF + BP coord           │  52.75%  │ Baseline — FF estándar           │
+  ├────────────────────────────────────┼──────────┼──────────────────────────────────┤
+  │ OctopusNet SFF (100% local)        │  53.16%  │ Mejor resultado previo           │
+  ├────────────────────────────────────┼──────────┼──────────────────────────────────┤
+  │ A18b: OctopusNet + CG + BP coord   │  64.17%  │ Nuevo máximo — +11 pts sobre SFF │
+  └────────────────────────────────────┴──────────┴──────────────────────────────────┘
+
+  Resiliencia A18b (fallo de módulos, mismo protocolo que A6):
+
+  ┌──────────────────────────┬──────────┬─────────────────┐
+  │ Configuración            │ Accuracy │ Degradación     │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ Sin fallo (4 módulos)    │  63.90%  │ -               │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ M0 falla (kernel 3)      │  53.74%  │ -10.16 pts      │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ M1 falla (kernel 5)      │  42.19%  │ -21.71 pts      │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ M2 falla (kernel 7)      │  55.25%  │ -8.65 pts       │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ M3 falla (kernel 9)      │  41.47%  │ -22.43 pts (*)  │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ Peor caso (M1+M2 fallan) │  22.32%  │ -41.58 pts      │
+  ├──────────────────────────┼──────────┼─────────────────┤
+  │ Mejor superviviente solo │  27.19%  │ M2 solo         │
+  └──────────────────────────┴──────────┴─────────────────┘
+  (*) Módulo más crítico
+
+  Hallazgo A18b:
+
+  1. Channel grouping mejora accuracy +11 pts sobre el mejor resultado previo (64.17% vs 53.16%).
+     El cuello de botella era el método de aprendizaje de los módulos, no la arquitectura de
+     coordinación.
+
+  2. Resiliencia se mantiene: ante fallo del módulo más crítico, A18b cae a 41.47% —
+     prácticamente idéntico al 41.72% de OctopusNet FF. Mejor accuracy, misma resiliencia.
+
+  3. Especialización más pronunciada: M1 y M3 (kernels 5 y 9) son los más críticos
+     (-21 pts), M0 y M2 (kernels 3 y 7) son más redundantes (-9 pts). El sistema tiene
+     módulos dominantes y módulos de respaldo — patrón más claro que en FF estándar.
+
+  4. Channel grouping elimina imágenes negativas externas: no se usa create_negatives()
+     ni overlay_label(). El aprendizaje local es más simple y computacionalmente directo.
+
+  Implicación: channel grouping (Ortiz Torres et al.) es una mejora drop-in al método de
+  aprendizaje de los módulos CNN. La arquitectura de OctopusNet (nerve ring, coordinator,
+  comunicación comprimida) es ortogonal y compatible.
+
+  5.7.9 Experimento A18c: CGCNNModule + Multiscala — Ablación de Componentes
+
+  Motivación: A6b usa CGCNNModule con kernels [3,5,7,9] sin multiscala. A18c agrega
+  entradas multi-resolución [32,16,8,4] para determinar si multiscala aporta sobre CG.
+
+  Método: Idéntico a A6b (CG + ModDrop p=0.5, 30 épocas, MultiStepLR) pero cada módulo
+  i recibe la imagen redimensionada a INPUT_SCALES[i] antes del forward pass.
+
+  Resultado:
+  ┌─────────────────────────────────┬──────────┐
+  │ Configuración                   │ Accuracy │
+  ├─────────────────────────────────┼──────────┤
+  │ A6b  (CG + ModDrop, sin multi)  │  64.34%  │
+  │ A18c (CG + ModDrop + multiscala)│  64.32%  │
+  └─────────────────────────────────┴──────────┘
+
+  Hallazgo A18c:
+  Diferencia de 0.02% — ruido estadístico. Multiscala no aporta con CGCNNModule.
+
+  Explicación: CGCNNModule usa AdaptiveAvgPool2d(4) internamente — toda entrada queda
+  reducida a 4×4 independientemente de la resolución de entrada. La diversidad de escala
+  queda destruida antes del proj. En FF estándar, multiscala sí aportaba porque la señal
+  Fourier se amplificaba en resoluciones bajas — ese mecanismo no existe en CG.
+
+  Conclusión: multiscala es redundante con CGCNNModule. A6b (sin multiscala) es la
+  configuración óptima — mismo accuracy, menor costo computacional.
+
+  Especialización por módulo (A18b):
+
+  ┌──────────┬────────┬──────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬───────┐
+  │ Módulo   │ plane  │ auto │ bird │ cat  │ deer │ dog  │ frog │ horse │ ship │ truck │
+  ├──────────┼────────┼──────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M0 (k=3) │  67%   │  0%  │  2%  │ 22%  │ 20%  │  2%  │  9%  │  2%   │  4%  │  68%  │
+  ├──────────┼────────┼──────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M1 (k=5) │  65%   │ 52%  │  0%  │  2%  │  0%  │ 88%  │ 17%  │  1%   │ 10%  │  37%  │
+  ├──────────┼────────┼──────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M2 (k=7) │  50%   │ 14%  │  1%  │  0%  │  3%  │  0%  │  0%  │  7%   │ 72%  │   9%  │
+  ├──────────┼────────┼──────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M3 (k=9) │  10%   │  1%  │  7%  │  0%  │ 26%  │  0%  │  0%  │  1%   │  7%  │  61%  │
+  └──────────┴────────┴──────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴───────┘
+
+  Hallazgo especialización A18b:
+
+  La especialización con channel grouping es extrema y limpia — cada módulo domina 2-3
+  clases específicas y falla casi completamente en las demás:
+
+  - M0 (k=3): airplane (67%) y truck (68%) — formas grandes y rectangulares
+  - M1 (k=5): dog (88%) y airplane (65%) — el módulo más especializado del sistema
+  - M2 (k=7): ship (72%) y airplane (50%) — objetos con fondo uniforme (cielo/agua)
+  - M3 (k=9): truck (61%) y deer (26%) — contexto de escena más que forma
+
+  Esto explica directamente el resultado de resiliencia: M1 es el único módulo que
+  clasifica dog con alta confianza (88%). Perderlo causa una caída de 21.71 pts porque
+  ningún otro módulo puede sustituirlo. La especialización es real, no redundante.
+
+  Contraste con FF estándar (A15b): en FF estándar los módulos comparten clases más
+  uniformemente (rangos 34-75%). En channel grouping la división es más drástica
+  (rangos 0-88%), lo que produce mejor accuracy ensemble pero menor redundancia ante
+  fallos múltiples. Este es el mecanismo estructural del tradeoff de resiliencia.
+
+  Figura: Especialización por módulo — Accuracy por clase (A15b)
+  [Ver module_specialization.png]
+
+  ┌──────────┬──────┬────────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬───────┐
+  │ Módulo   │plane │  auto  │ bird │ cat  │ deer │ dog  │ frog │ horse │ ship │ truck │
+  ├──────────┼──────┼────────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M1 res32 │  34% │  52%   │  38% │  17% │  11% │  75% │  67% │  42%  │  42% │  66%  │
+  ├──────────┼──────┼────────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M2 res16 │  32% │  73%   │  34% │  49% │  17% │  41% │  64% │  50%  │  73% │  48%  │
+  ├──────────┼──────┼────────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M3 res8  │  48% │  57%   │  22% │  35% │  23% │  40% │  74% │  48%  │  69% │  54%  │
+  ├──────────┼──────┼────────┼──────┼──────┼──────┼──────┼──────┼───────┼──────┼───────┤
+  │ M4 res4  │  38% │  20%   │  28% │  14% │  30% │  41% │  51% │  40%  │  59% │  61%  │
+  └──────────┴──────┴────────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴───────┘
+
+  Hallazgos de especialización por clase:
+
+  1. **Especialización genuina por clase**: cada módulo domina clases distintas.
+     M1 (res=32) lidera en dog (75%) y frog (67%) — detalles de textura fina.
+     M2 (res=16) lidera en automobile (73%) y ship (73%) — formas geométricas medias.
+     M3 (res=8) lidera en frog (74%) — patrones de color a escala gruesa.
+     M4 (res=4) colapsa en automobile (20%) y cat (14%) — contexto global insuficiente.
+
+  2. **Cat y deer son las clases más difíciles para todos los módulos**:
+     cat: 17%/49%/35%/14% — alta variabilidad de pose y escala.
+     deer: 11%/17%/23%/30% — M4 es el menos malo, sugiere que silueta global ayuda más
+     que detalle para esta clase.
+
+  3. **Complementariedad real**: dog es M1=75% pero M2=41% — el ensemble se beneficia
+     porque cuando M1 falla en otras clases, M2/M3 compensan. Sin esta
+     complementariedad, promediar módulos no daría ganancia sobre el mejor individual.
+
+  4. **M4 paradox visualizado**: M4 tiene mejor separación FF (sep=0.61 inicial) pero
+     accuracy individual más baja en 8 de 10 clases. El heatmap muestra directamente
+     por qué: sin detalle, automobile (20%) y cat (14%) son indistinguibles a 4×4 píxeles.
+
+  Tabla de resultados principales:
+  ┌──────────────────────────────────────┬───────┬──────────┬───────────┬──────────────────────┐
+  │             Modelo                   │ MNIST │ CIFAR-10 │ CIFAR-100 │ Resiliencia (1 fallo)│
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ Baseline CNN (backprop)              │ -     │  90.96%  │ -         │ 10.00% (colapso)     │
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet homogéneo v2 + FF         │ -     │  48.42%  │ -         │ -                    │
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet homogéneo v3 + FF         │ -     │  51.83%  │ -         │ 13.89-45.41%         │
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet v3 + FF + ModDrop         │ -     │  52.50%  │ -         │ 41.72-49.61%         │
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet A15b (100% local, sin BP) │ -     │  53.16%  │ -         │ -                    │
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet A18b (CG + BP coord)      │ -     │  64.17%  │ -         │ 41.47% (fallo crítico)│
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet A6b (CG + ModDrop)        │ -     │  64.34%  │ -         │ 61.12% (fallo crítico)│
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ OctopusNet heterogéneo + FF          │ -     │  47.39%  │ -         │ -                    │
+  ├──────────────────────────────────────┼───────┼──────────┼───────────┼──────────────────────┤
+  │ FedAvg                               │ -     │  -       │ -         │ -                    │
+  └──────────────────────────────────────┴───────┴──────────┴───────────┴──────────────────────┘
+
+  Notas sobre resultados CIFAR-10 (FF puro, aprendizaje local):
+  - Homogéneo: 4 CNNs k=3×3, resoluciones [32,16,8,4], 50 épocas, best en época 26
+  - Heterogéneo: CNN×2 + Transformer + LSTM, resoluciones [32,16,8,4], 30 épocas, best en época 28
+  - Ambos con LayerNorm entre capas conv (estabilización de activaciones)
+  - Ambos con threshold adaptativo y Fourier label embedding K=0.5
+  - Params totales: ~1.67M (homogéneo), ~1.8M (heterogéneo)
+  - Heterogéneo no supera homogéneo — hipótesis: Transformer/LSTM en res=8/4 tienen
+    insuficiente información sin señal de clasificación local (motiva experimento aux classifiers)
+  Gráficas pendientes:
+  - Accuracy vs número de módulos
+  - Accuracy vs tamaño de bottleneck
+  - Degradación de accuracy al desconectar módulos
+  - Comunicación total: OctopusNet vs FedAvg
+  - A10: Comparación de mecanismos de competición GWT
+
+  Tabla A10 - Mecanismos de Competición (CIFAR-10, 5 épocas):
+  ┌─────────────────────────────┬──────────┬─────────────────────────────────────────────┐
+  │         Mecanismo           │ Accuracy │              Notas                          │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────┤
+  │ A10a: Soft (baseline)       │  43.72%  │ Softmax estándar — curva ascendente fuerte  │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────┤
+  │ A10c: Top-2                 │  42.32%  │ Solo 2 módulos contribuyen — subiendo       │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────┤
+  │ A10b: Gumbel-hard           │  39.33%  │ Selección dura — plateau temprano           │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────────────────┤
+  │ A10d: Top-1 (winner-take-all│  38.09%  │ Solo 1 módulo "gana" — inestable            │
+  └─────────────────────────────┴──────────┴─────────────────────────────────────────────┘
+
+  Nota: experimento preliminar (5 épocas). Soft se ejecutará a 50 épocas completas como
+  configuración final. Los demás quedan documentados como variantes para casos de uso específicos.
+
+  Tabla de tradeoff velocidad-accuracy (guía de configuración para producción):
+  ┌──────────────┬──────────┬─────────────────┬─────────────┬──────────────────────────────┐
+  │  Mecanismo   │ Accuracy │ Módulos activos │  Velocidad  │ Caso de uso recomendado      │
+  ├──────────────┼──────────┼─────────────────┼─────────────┼──────────────────────────────┤
+  │ Soft         │  43.72%  │ 4/4 (100%)      │ Base        │ Máxima accuracy, sin límite  │
+  ├──────────────┼──────────┼─────────────────┼─────────────┼──────────────────────────────┤
+  │ Top-K=2      │  42.32%  │ 2/4 (50%)       │ ~2x más rápido│ Balance accuracy/cómputo   │
+  ├──────────────┼──────────┼─────────────────┼─────────────┼──────────────────────────────┤
+  │ Gumbel-hard  │  39.33%  │ 1/4 (25%)       │ ~4x más rápido│ Cómputo muy limitado       │
+  ├──────────────┼──────────┼─────────────────┼─────────────┼──────────────────────────────┤
+  │ Top-K=1      │  38.09%  │ 1/4 (25%)       │ ~4x + interpretable│ Diagnóstico, debug    │
+  └──────────────┴──────────┴─────────────────┴─────────────┴──────────────────────────────┘
+
+  Hallazgos A10:
+
+  1. **Tradeoff accuracy-cómputo configurable**: cada mecanismo ofrece un punto distinto
+     en la curva. Top-K=2 sacrifica solo 1.4% de accuracy por 50% de reducción de cómputo
+     — atractivo para dispositivos IoT con recursos limitados.
+
+  2. **Soft attention óptimo para máxima accuracy con N=4**: selección suave supera
+     selección dura porque con solo 4 módulos, zerear 2-3 pierde información crítica.
+     GWT biológico opera con miles de módulos — la selección dura tiene sentido a esa
+     escala, no a N=4.
+
+  3. **Gumbel-hard y Top-1 platéan temprano**: convergencia más rápida inicial pero
+     techo más bajo. La selección one-hot impide que módulos secundarios corrijan errores
+     del módulo ganador.
+
+  4. **Top-K=1 es interpretable**: en cada inferencia, un solo módulo decide. Útil para
+     diagnóstico — permite saber exactamente qué escala procesó cada imagen.
+
+  5. **Soft como default confirmado empíricamente**: todos los experimentos previos
+     (A6b, A8, A15b) usaron soft — A10 valida esta elección retroactivamente.
+
+  Tabla A11 - Threshold Adaptativo (CIFAR-10):
+  ┌─────────────────────────────┬──────────┬─────────────────────────────────┐
+  │         Threshold           │ Accuracy │              Notas              │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────┤
+  │ A11a: Fijo (θ=2.0)          │ -        │ Valor del paper de Hinton       │
+  ├─────────────────────────────┼──────────┼─────────────────────────────────┤
+  │ A11b: Adaptativo            │ -        │ θ = (g_pos + g_neg) / 2         │
+  └─────────────────────────────┴──────────┴─────────────────────────────────┘
+
+  5.7.10 Experimento A19: CGCNNModule + ResBlocks — ¿Escala FF en Profundidad?
+
+  Pregunta: ¿agregar ResBlocks dentro de CGCNNModule mejora accuracy o resiliencia?
+
+  Motivación: A6b usa CGCNNModule con solo 2 capas conv. La hipótesis es que
+  ResBlocks internos con skip connections darían representaciones más ricas por
+  módulo, potencialmente superando el 64.34% de A6b.
+
+  Arquitectura (CGCNNModuleV2):
+    stem: Conv2d(3→160) + GroupNorm(10,160) + ReLU
+    res1: [Conv2d(160→160,g=10) + GN + ReLU + Conv2d + GN] + skip
+    res2: igual
+    AdaptiveAvgPool2d(4) → Linear(2560→64)
+
+  Cambios respecto a CGCNNModule (A6b):
+  - BatchNorm2d → GroupNorm(num_classes, total_ch) en toda la arquitectura
+  - 2 ResBlocks con skip connection entre stem y pool
+  - Parámetros por módulo: ~278K (A6b) → ~278K*4 = 1,112,576 total (A19)
+
+  Config idéntica a A6b: 30 epochs, MultiStepLR [10,20,27] γ=0.1,
+  Module Dropout p=0.5, kernels [3,5,7,9], bottleneck=64, batch=128.
+
+  Resultados:
+  ┌──────────────────┬──────────┬──────────────┬───────────────┐
+  │ Configuración    │ Accuracy │ Floor single │ Floor doble   │
+  ├──────────────────┼──────────┼──────────────┼───────────────┤
+  │ A6b (CGCNNMod)   │  64.34%  │    61.12%    │    52.87%     │
+  ├──────────────────┼──────────┼──────────────┼───────────────┤
+  │ A19 (+ ResBlocks)│  63.24%  │    58.28%    │    49.74%     │
+  └──────────────────┴──────────┴──────────────┴───────────────┘
+
+  Resiliencia A19 (single failure):
+    M0 falla: 58.28%  ← módulo crítico
+    M1 falla: 62.27%
+    M2 falla: 62.11%
+    M3 falla: 61.92%
+
+  Resiliencia A19 (double failure):
+    M[0,1]: 49.74%  M[0,2]: 54.68%  M[0,3]: 53.28%
+    M[1,2]: 61.14%  M[1,3]: 57.96%  M[2,3]: 56.47%
+
+  Hallazgo A19:
+
+  ResBlocks no mejoran — A19 pierde en accuracy (−1.10%) y en resiliencia
+  (floor single −2.84 pts, floor doble −3.13 pts) respecto a A6b.
+
+  Tres observaciones:
+
+  1. FF no escala en profundidad pura. La curva de entrenamiento mostró plateau
+     temprano (epochs 12-15) seguido de recuperación parcial — comportamiento
+     consistente con la literatura: "prediction accuracy tends to deteriorate
+     progressively with network depth" bajo FF (Scientific Reports, 2025).
+     Cada ResBlock recibe señal ya procesada por el anterior, dificultando
+     que el ff_loss propague información de clase efectivamente a través de
+     múltiples saltos residuales.
+
+  2. El cuello de botella es AdaptiveAvgPool2d(4), no la capacidad del módulo.
+     Con 4.5× más parámetros (1.1M vs ~247K) el gain es −1.10% — la información
+     adicional que construyen los ResBlocks queda destruida por la compresión
+     agresiva a 4×4 antes del proj Linear. Más profundidad sin cambiar el pooling
+     es ineficiente.
+
+  3. Resiliencia peor: M0 sigue siendo módulo crítico (58.28%), igual que en
+     modelos anteriores sin Module Dropout. Los ResBlocks no distribuyeron mejor
+     la carga entre módulos — el Module Dropout de A6b es más efectivo para
+     resiliencia que profundidad adicional.
+
+  Conclusión: OctopusNet alcanza su máxima eficiencia con arquitectura somera.
+  Profundidad residual bajo FF puro no justifica el costo computacional, validando
+  la preferencia por estructura modular distribuida (más brazos) sobre jerárquica
+  profunda (brazos más largos). El camino hacia mayor accuracy pasa por cambiar
+  el pooling o aumentar canales por grupo — no por profundidad.
+
+  5.7.11 Experimento A20: CGCNNModule + Pool 6×6
+
+  Pregunta: ¿el pooling agresivo AdaptiveAvgPool2d(4) es el cuello de botella?
+
+  Método: idéntico a A6b. Solo cambia: AdaptiveAvgPool2d(4) → (6).
+  proj ajustado: Linear(total_ch * 36, bottleneck_size).
+
+  Resultados:
+  ┌──────────────────┬──────────┬──────────────┬───────────────┐
+  │ Configuración    │ Accuracy │ Floor single │ Floor doble   │
+  ├──────────────────┼──────────┼──────────────┼───────────────┤
+  │ A6b (pool 4×4)   │  64.34%  │    61.12%    │    52.87%     │
+  ├──────────────────┼──────────┼──────────────┼───────────────┤
+  │ A20 (pool 6×6)   │  61.49%  │    56.50%    │    35.85%     │
+  └──────────────────┴──────────┴──────────────┴───────────────┘
+
+  Conclusión: pool más grande empeora en todo. El pooling espacial no era
+  el cuello de botella. Pool 6×6 genera proj más grande → más params →
+  dependencias más fuertes entre módulos → peor resiliencia.
+
+  5.7.12 Experimento A22: goodness_per_group Pre-Pool
+
+  Pregunta: ¿medir goodness sobre el feature map completo (antes del pool)
+  mejora la señal FF y permite aprender features más discriminativas?
+
+  Método: idéntico a A6b. Solo cambia: goodness_per_group mide sobre
+  conv(x) de forma (B,160,H,W) en vez de pool(conv(x)) de forma (B,160,4,4).
+  El forward() sigue usando pool para el bottleneck al coordinator.
+
+  Resultado: 62.96% — por debajo de A6b (64.34%).
+
+  Conclusión: goodness pre-pool no mejora la señal FF. El ff_loss ve más
+  información espacial pero no la aprovecha — la señal canal→clase de
+  goodness_per_group es igualmente efectiva con o sin pool. El cuello no
+  está en dónde se mide la goodness.
+
+  5.7.13 Experimento A21: CGCNNModule + Stride Conv (Compresión Aprendida)
+
+  Pregunta: ¿reemplazar AdaptiveAvgPool2d(4) con Conv2d(stride=2) aprendidos
+  mejora accuracy y resiliencia? Hipótesis: pool promedia y destruye información;
+  stride conv aprende qué comprimir.
+
+  Método: idéntico a A6b. Solo cambia: AdaptiveAvgPool2d(4) → dos Conv2d
+  (stride=2, groups=num_classes) + AdaptiveAvgPool2d(4) flush final.
+  Pipeline: conv(x) → compress [stride×2 + stride×2 + pool flush] → proj.
+  30 épocas, MultiStepLR milestones=[10,20,27], Module Dropout p=0.5.
+  4 módulos con kernels [3,5,7,9].
+
+  Resultados:
+  ┌──────────────────────────┬──────────┬──────────────┬───────────────┐
+  │ Configuración            │ Accuracy │ Floor single │ Floor doble   │
+  ├──────────────────────────┼──────────┼──────────────┼───────────────┤
+  │ A6b (AdaptiveAvgPool)    │  64.34%  │    61.12%    │    52.87%     │
+  ├──────────────────────────┼──────────┼──────────────┼───────────────┤
+  │ A21 (stride conv)        │  69.22%  │    66.28%    │    47.69%     │
+  └──────────────────────────┴──────────┴──────────────┴───────────────┘
+
+  Resiliencia detallada A21:
+  Full: 69.07%
+  M0 falla: 67.86%  |  M1 falla: 66.28%  |  M2 falla: 66.94%  |  M3 falla: 68.04%
+  Floor single: 66.28% (M1)
+  M[0,1]: 63.25%  |  M[0,2]: 64.83%  |  M[0,3]: 66.63%
+  M[1,2]: 47.69%  |  M[1,3]: 60.53%  |  M[2,3]: 66.42%
+  Floor doble: 47.69% (M1+M2)
+
+  Análisis:
+  - Accuracy: +4.88 pts sobre A6b — mayor ganancia de cualquier experimento
+  - Floor single: +5.16 pts — resiliencia individual también mejora
+  - Floor doble: −5.18 pts — M1+M2 simultáneos bajan a 47.69%
+  - M1 (kernel=5) y M2 (kernel=7) se co-especializaron — el coordinador
+    depende de ambos juntos más de lo esperado con Module Dropout p=0.5
+
+  Conclusión: stride conv aprende compresión significativamente mejor que
+  pool promedio. Tradeoff explícito: +5% accuracy, resiliencia single mejora,
+  resiliencia doble se sacrifica en la combinación M1+M2. Hipótesis confirmada:
+  la compresión aprendida supera la compresión fija para FF local.
+
+  5.7.14 Experimento A21b: CGCNNModule + Stride Conv + Module Dropout p=0.7
+
+  Pregunta: ¿aumentar Module Dropout a p=0.7 recupera el floor doble de A21
+  (47.69%) sin sacrificar accuracy?
+
+  Motivación: A21 (p=0.5) mostró co-especialización de M1+M2 — juntos caen
+  a 47.69%, peor que A6b (52.87%). Hipótesis: p=0.7 fuerza al coordinador
+  a distribuir más uniformemente entre módulos.
+
+  Método: idéntico a A21. Solo cambia: MODULE_DROPOUT = 0.5 → 0.7.
+  30 épocas, MultiStepLR milestones=[10,20,27], kernels [3,5,7,9], bottleneck=64.
+
+  Resultados:
+  ┌──────────────────────────┬──────────┬──────────────┬───────────────┐
+  │ Configuración            │ Accuracy │ Floor single │ Floor doble   │
+  ├──────────────────────────┼──────────┼──────────────┼───────────────┤
+  │ A6b  (pool, p=0.5)       │  64.34%  │    61.12%    │    52.87%     │
+  ├──────────────────────────┼──────────┼──────────────┼───────────────┤
+  │ A21  (stride, p=0.5)     │  69.22%  │    66.28%    │    47.69%     │
+  ├──────────────────────────┼──────────┼──────────────┼───────────────┤
+  │ A21b (stride, p=0.7)     │  68.65%  │    67.03%    │    56.03%     │
+  └──────────────────────────┴──────────┴──────────────┴───────────────┘
+
+  Resiliencia detallada A21b:
+  Full: 68.65%
+  M0 falla: 67.03%  |  M1 falla: 67.60%  |  M2 falla: 67.61%  |  M3 falla: 67.35%
+  Floor single: 67.03% (M0)
+  M[0,1]: 63.86%  |  M[0,2]: 65.45%  |  M[0,3]: 56.03%
+  M[1,2]: 65.38%  |  M[1,3]: 61.36%  |  M[2,3]: 59.51%
+  Floor doble: 56.03% (M0+M3)
+
+  Nota: A21 y A21b corrieron sin seed fija — diferencia de 0.57% puede incluir
+  varianza de inicialización. Comparación cualitativa válida, no cuantitativa exacta.
+
+  Análisis:
+  - Accuracy: −0.57 pts vs A21 — costo mínimo, dentro de varianza de inicialización
+  - Floor single: +0.75 pts vs A21 — resiliencia individual más uniforme
+  - Floor doble: +8.34 pts vs A21 — resuelve la co-especialización M1+M2
+  - M[1,2]: 47.69% → 65.38% — el problema catastrófico de A21 desaparece
+  - Floor doble supera A6b por +3.16 pts
+
+  Conclusión: p=0.7 es el balance óptimo para stride conv. La distribución de
+  especialización es más uniforme — ningún par de módulos es punto de falla
+  catastrófico. A21b mejora A6b en las tres métricas simultáneamente:
+  +4.31% accuracy, +5.91pts floor single, +3.16pts floor doble.
+
+  A21b es la nueva configuración de referencia.
+
+  5.7.15 Experimento A21c: Distance-Forward Loss sobre Stride Conv (Resultado Negativo)
+
+  Motivación: Distance-Forward (DF) loss [arXiv:2408.14925] reemplaza la medida de
+  goodness escalar por distancias en un espacio de proyección aprendido (W_x, W_y),
+  con margin ranking loss entre la clase correcta y la más cercana incorrecta.
+  Hipótesis: mejor señal de aprendizaje local → mejor specialización → mejor resilencia.
+
+  Configuración: idéntica a A21b (stride conv, module dropout p=0.7, 4 módulos,
+  MultiStepLR milestones=[10,20,27]). Solo cambia ff_loss → df_loss con proyecciones
+  W_x ∈ R^{2560×128}, W_y (embedding de clases) ∈ R^{10×128}, margin=1.0, λ=0.1.
+
+  Resultado (30 épocas, CIFAR-10):
+
+    Métrica              A21b (FF+CG)   A21c (DF+CG)   Δ
+    ─────────────────────────────────────────────────────
+    Accuracy normal       68.65%         63.83%         −4.82%
+    Floor single          67.03%         60.14%         −6.89%
+    Floor doble           56.03%         24.67%         −31.36%
+
+    Desglose fallo single:
+      M0 falla: 61.78%
+      M1 falla: 60.14%  ← peor
+      M2 falla: 60.60%
+      M3 falla: 61.62%
+
+    Desglose fallo doble:
+      M[0,1]: 54.36%
+      M[0,2]: 58.42%
+      M[0,3]: 57.00%
+      M[1,2]: 24.67%  ← par catastrófico (co-especialización M1+M2)
+      M[1,3]: 55.13%
+      M[2,3]: 57.25%
+
+  Análisis: A21c recupera el par catastrófico M[1,2]=24.67% que A21b había eliminado.
+  Esto indica que DF loss no logra la independencia representacional que module dropout
+  p=0.7 + channel grouping garantizan en A21b.
+
+  La causa probable es interferencia entre mecanismos: channel grouping ya impone
+  discriminación por clase vía goodness_per_group (señal de competencia intra-módulo).
+  DF loss agrega una segunda señal de discriminación via distancias en espacio proyectado.
+  Las dos señales compiten en lugar de cooperar — los módulos no convergen a
+  representaciones complementarias sino a soluciones locales subóptimas.
+
+  DF loss fue diseñado como reemplazo completo del sistema de goodness, no como
+  combinación con channel grouping. Usarlo sobre CGCNNModule viola esa premisa.
+
+  Conclusión: A21c descartado. DF loss incompatible con channel grouping en este
+  régimen. A21b permanece como configuración de referencia.
+
+  5.7.16 Ablation Study Consolidada (CIFAR-10)
+
+  Cada experimento cambia UN componente respecto a la configuración base (v3: bn=64,
+  multiscale [32,16,8,4], LayerNorm, augmentation, Fourier K=0.5, 50 épocas).
+
+  ┌──────────────────────────────────┬──────────┬──────────┬──────────┬───────────────────────────────────┐
+  │ Componente                       │  Sin él  │  Con él  │ Impacto  │ Experimento                       │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ LayerNorm entre capas conv       │  23.02%  │  48.42%  │ +25.40%  │ v1→v2: sin/con LayerNorm          │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ Multi-escala [32,16,8,4]         │ ~30-35%* │  48.42%  │ ~+15%*   │ A1-obs: misma res vs multiscale   │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ Data augmentation (crop+hflip)   │  48.42%  │  51.83%  │  +3.41%  │ v2→v3: sin/con augmentation       │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ Bottleneck B=64 (vs B=32)        │ sep=0.949│ sep=1.227│ +0.278   │ Selección empírica de bottleneck  │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ Module Dropout (p=0.25)          │  50.20%  │  52.50%  │  +2.30%* │ A6b: sin/con ModDrop              │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ Nerve Ring (cross-attention)     │  51.38%  │  51.45%  │  +0.07%  │ A8: sin/con nerve ring            │
+  ├──────────────────────────────────┼──────────┼──────────┼──────────┼───────────────────────────────────┤
+  │ Coord. backprop → 100% local     │  52.50%  │  53.16%  │  +0.66%  │ A15b: coord backprop vs aux cls   │
+  └──────────────────────────────────┴──────────┴──────────┴──────────┴───────────────────────────────────┘
+  * Multi-escala: accuracy sin multiscale no medida directamente — estimada desde A1-obs
+    (coordinador ignora módulos intermedios, atención concentrada en M1/M4).
+  * ModDrop +2.30%: resultado de una corrida, puede incluir varianza de inicialización.
+
+  Experimentos recientes (post-A6b, base = CGCNNModule + stride conv):
+
+  ┌─────────────────────────────────────┬──────────┬────────────┬────────────┬──────────────────────────────────┐
+  │ Experimento                         │  Acc     │ Floor-1    │ Floor-2    │ Nota                             │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A6b (CG + ModDrop p=0.5, pool)      │  64.34%  │   61.12%   │   52.87%   │ baseline post-CG                 │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A17 (nerve ring iterativo N rondas) │  ~63%    │    —       │    —       │ rondas>1 homogenizan, peor       │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A19 (CG + ResBlocks)                │  63.24%  │    —       │    —       │ FF no escala en profundidad      │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A20 (pool 4×4 → 6×6)               │  61.49%  │   56.50%   │   35.85%   │ pool espacial no era cuello bot. │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A21 (pool → stride conv, p=0.5)     │  69.22%  │   66.28%   │   47.69%   │ par catastrófico M1+M2           │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A21b (stride conv + ModDrop p=0.7)  │  68.65%  │   67.03%   │   56.03%   │ MEJOR OVERALL — sin pares cat.   │
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A21c (DF loss sobre stride conv)    │  63.83%  │   60.14%   │   24.67%   │ NEGATIVO — DF incompatible con CG│
+  ├─────────────────────────────────────┼──────────┼────────────┼────────────┼──────────────────────────────────┤
+  │ A22 (goodness pre-pool vs post)     │  62.96%  │    —       │    —       │ NEGATIVO — localización no importa│
+  └─────────────────────────────────────┴──────────┴────────────┴────────────┴──────────────────────────────────┘
+
+  Hallazgos de ablación:
+  1. LayerNorm es el componente más crítico (+25.40%) — sin él, activaciones explotan
+  2. Multi-escala es el segundo más importante — sin ella, módulos son redundantes
+  3. Nerve ring es redundante para CIFAR-10 (+0.07%) — coordinador ya captura relaciones
+  4. Sistema 100% local (A15b) iguala o supera coordinador con backprop (+0.25%)
+  5. Module Dropout mejora resiliencia dramáticamente con costo mínimo de accuracy
+  6. Stride conv (compresión aprendida) supera AdaptiveAvgPool en accuracy y resilencia
+  7. p=0.7 elimina co-especialización entre módulos que p=0.5 no elimina (par M1+M2)
+  8. DF loss incompatible con channel grouping — dos mecanismos de discriminación interfieren
+
+5.8 Hardware
+
+  Los experimentos se ejecutarán en:
+  - Google Colab Pro (GPU T4/V100)
+  - O cluster universitario si está disponible
+
+  Tiempo estimado de entrenamiento: [completar después de pruebas iniciales]
+
+6. DISCUSIÓN
+
+6.1 Interpretación de Resultados Principales
+
+El resultado central de este trabajo es la demostración empírica de que resiliencia estructural y accuracy no son tradeoff irreconciliable. OctopusNet A6b (Channel Grouping + Module Dropout) alcanza 64.34% en CIFAR-10 — 11 puntos sobre el mejor resultado FF previo — y mantiene mínimo 61.12% ante el fallo de cualquier módulo individual. La degradación máxima ante fallo simple es de −3.22 puntos porcentuales, vs −80.96 puntos en CNN backprop. CNN con backprop alcanza 90.96% pero colapsa a 10% (azar) ante cualquier fallo de componente.
+
+Este tradeoff no es un bug de la arquitectura sino una consecuencia estructural: la serialización secuencial de CNN hace que cualquier fallo se propague en cascada, mientras que la paralelización modular de OctopusNet contiene los fallos localmente. El coordinador con atención dinámica redistribuye automáticamente su confianza hacia los módulos funcionando — sin intervención externa, sin reconfiguración manual.
+
+6.2 Especialización Emergente
+
+La hipótesis central era que el bottleneck de comunicación forzaría especialización. Los resultados de A6 la confirman: cada módulo captura información genuinamente diferente, evidenciado por caídas de accuracy distintas al fallar cada uno (M1: -15.69%, M2: -36.31%, M3: -8.83%, M4: -4.79%). Si los módulos fueran redundantes, las caídas serían uniformes.
+
+El hallazgo más significativo es la criticidad de M2 (res=16×16). Tres experimentos independientes convergen en la misma conclusión:
+
+- **Experimento A6 (resiliencia)**: M2 falla → caída de 36.31% — la mayor de todos los módulos
+- **Experimento A15b (pesos de atención)**: M2 peso=0.341 — segundo mayor después de M1
+- **Experimento A15b (accuracy individual)**: M2 individual=48.81% — mejor módulo solo
+
+Tres ángulos distintos, misma conclusión: resolución 16×16 captura el punto óptimo entre detalle y contexto para CIFAR-10. M2 actúa como "traductor" entre la escala fina (M1/32×32) y las escalas gruesas (M3/8×8, M4/4×4).
+
+La paradoja de M4 refuerza este hallazgo: M4 (res=4×4) tiene la mejor separación FF inicial (sep=0.61), aprende más rápido con Forward-Forward. Sin embargo, clasifica peor individualmente (38.79%) y el coordinador le asigna el menor peso (0.108). El contexto global sin detalle no distingue clases similares (perro vs gato) — la separación FF local no está alineada con clasificación global. M4 demuestra con más claridad que cualquier otro módulo el problema fundamental de FF local: goodness alta no implica clasificación correcta.
+
+Esta especialización no fue diseñada — emergió del entrenamiento con bottleneck comprimido, exactamente como predice la teoría de especialización modular bajo restricciones de recursos (Nature Communications, 2024).
+
+6.3 Module Dropout como Regularización de Resiliencia
+
+El experimento A6b combina Module Dropout con Channel Grouping. Durante el entrenamiento del coordinador, con probabilidad p=0.5 se zeroa un módulo aleatorio por batch. El efecto:
+
+- Accuracy: 64.34% vs 64.17% de A18b sin ModDrop (+0.17%) — sin costo
+- Floor single-failure: 61.12% vs 41.47% de A18b (+19.65 pts) — ganancia masiva
+- Floor double-failure: 52.87% — ante 50% de módulos muertos, sistema funcional
+
+La mejora en resiliencia sin penalización de accuracy confirma que Module Dropout actúa como regularización pura: forzar al coordinador a no depender de ningún módulo específico produce representaciones distribuidas que mantienen accuracy normal y además son robustas ante fallos. El mecanismo es análogo al Dropout estándar (Srivastava et al., 2014) pero aplicado a módulos completos, y a Stochastic Depth (Huang et al., 2016) pero sobre módulos paralelos FF con coordinador de atención. La combinación con Channel Grouping no existe en literatura previa.
+
+Module Dropout es la configuración recomendada por defecto — no hay razón para no usarlo.
+
+6.4 Nerve Ring: Redundancia con el Coordinador
+
+El experimento A8 muestra que el nerve ring (cross-attention lateral entre módulos) aporta +0.07% de accuracy — diferencia no significativa. El coordinador con atención dinámica ya captura las relaciones inter-módulo sin necesitar comunicación lateral explícita. Para CIFAR-10, el nerve ring es redundante.
+
+La hipótesis es que el nerve ring sería más valioso en tareas donde la comunicación lateral importa más: datasets multimodales donde diferentes modalidades necesitan coordinarse antes de llegar al coordinador, o tareas con dependencias espaciales complejas. Esta validación queda como trabajo futuro.
+
+6.5 Bottleneck Óptimo
+
+El experimento de selección de bottleneck mostró que B=64 es el punto óptimo: sep=1.227 vs sep=0.949 con B=32. B=128 y B=256 no mejoran la separación FF pero aumentan el cómputo. B=64 balancea capacidad de representación y eficiencia — análogo a las 30,000 fibras nerviosas del pulpo que comprimen ~500M neuronas a un canal de comunicación mínimo pero suficiente.
+
+6.6 Gap FF vs Backprop
+
+El gap de 38.39% entre OctopusNet FF (52.50%) y CNN backprop (90.96%) es real y esperado. Backprop propaga gradientes globales — cada peso sabe exactamente cuánto contribuyó al error. FF aprende localmente con señal más ruda (goodness alta/baja). Trabajos recientes muestran que este gap se reduce con arquitecturas más sofisticadas: SCFF alcanza 80.75% en CIFAR-10 con FF puro, y Ortiz Torres et al. (2025) llegan a 84.7% integrando feedback connections — el techo actual de FF en CIFAR-10. OctopusNet no optimiza para accuracy máximo en FF — optimiza para la combinación accuracy + resiliencia + aprendizaje local. La separación FF tras entrenamiento completo (sep: 2.24/3.63/3.41/1.85 por módulo) confirma que FF converge correctamente; el límite de accuracy está en la capacidad del coordinador, no en la calidad de los negativos.
+
+6.7 Limitaciones
+
+1. **Gap de accuracy vs backprop**: 38.39% de diferencia en CIFAR-10. En aplicaciones donde accuracy >80% es requerido y resiliencia no es crítica, CNN con backprop es la elección correcta. OctopusNet es complementario, no sustituto.
+
+2. **Coordinador con backprop**: los módulos usan FF (aprendizaje local), pero el coordinador usa backpropagation. El sistema no es 100% local — es un híbrido. Trabajo futuro puede explorar coordinadores entrenados con FF o Forward Target Propagation.
+
+3. **Escalabilidad no validada**: experimentos en CIFAR-10 (32×32). El comportamiento en ImageNet (224×224) o datasets con más clases requiere validación. CIFAR-100 es el siguiente paso natural.
+
+4. **Reproducibilidad**: todos los resultados provienen de una corrida experimental por configuración. Se requieren N≥3 corridas con seed fijo para confirmar que las diferencias de accuracy son significativas y no varianza de inicialización. La mejora de resiliencia (+19.65 pts en floor) es estructuralmente robusta por diseño; la diferencia de accuracy (+0.17%) requiere validación estadística.
+
+5. **Nerve ring no validado en tareas complejas**: el resultado negativo en CIFAR-10 no descarta su utilidad en datasets multimodales o con mayor complejidad estructural.
+
+6. **Feedback top-down no cuantificado**: el mecanismo de feedback está implementado pero su impacto en accuracy no fue medido experimentalmente en esta versión. Queda como experimento A7 para trabajo futuro.
+
+7. **Rigidez de CGCNNModule**: los grupos de canales están asignados fijamente a clases (10 grupos para CIFAR-10). Esto reduce flexibilidad representacional — imágenes ambiguas u ocluidas tienen menos espacio de representación que con CNNModule de features libres. El mapeo clase→grupo es hardcoded: cambiar de dataset requiere rediseñar el grouping. A CIFAR-100 le corresponderían 100 grupos → 1600 canales totales (100×16), escalable pero costoso. ImageNet (1000 clases) sería impracticable sin reducir channels_per_group agresivamente. OctopusNet como arquitectura es agnóstico al módulo — CNNModule sigue siendo válido cuando la rigidez de CG es inaceptable.
+
+6.8 OctopusNet vs Sistemas Multiagente y Ensemble
+
+Una pregunta natural es si la resiliencia de OctopusNet puede replicarse con enfoques
+más simples: Deep Ensembles, Mixture of Experts, sistemas multiagente modernos, o
+bagging. La respuesta es que comparten el objetivo pero difieren fundamentalmente en
+el mecanismo y el dominio de aplicación.
+
+**Deep Ensembles**: múltiples copias del mismo modelo entrenadas con backprop y
+diferentes seeds. Logran resiliencia por redundancia idéntica, no por especialización.
+Si un módulo falla en OctopusNet, la caída de accuracy varía por módulo (A6b:
+−3.22 a −0.17 pts) — señal directa de especialización genuina. En Deep Ensembles,
+perder cualquier copia produce caídas uniformes. Adicionalmente, Deep Ensembles
+requieren N modelos completos en memoria — OctopusNet es un único modelo con
+módulos compartiendo el mismo coordinador.
+
+**Mixture of Experts (MoE)**: router centralizado decide qué experto procesa cada
+input. Si el router falla, todo el sistema falla — punto único de falla que OctopusNet
+elimina por diseño. MoE usa backprop global; OctopusNet usa FF local.
+
+**Sistemas multiagente modernos**: agentes independientes en servidores diferentes,
+con comunicación de red, orquestador centralizado. Logran resiliencia de sistema
+pero a costo de infraestructura: GPU por agente, latencia de red, el orquestador
+mismo puede fallar. OctopusNet logra resiliencia estructural dentro de un único
+modelo en un único dispositivo — sin comunicación de red, sin orquestador, sin
+backprop global. Es viable en un chip embebido de bajo costo donde un sistema
+multiagente es imposible.
+
+**La diferencia esencial**: resiliencia por redundancia de infraestructura (multiagente)
+vs resiliencia estructural emergente (OctopusNet). La especialización emergente —
+demostrada en A18b donde M1 domina dog (88%) y M2 domina ship (72%), con pares
+catastróficos específicos que Module Dropout elimina — no es replicable con ensemble
+clásico. Esta dinámica es evidencia de que OctopusNet no es "ensemble con pasos extra",
+sino una arquitectura con propiedades de distribución de representación cualitativamente
+diferentes.
+
+**CNN modular con backprop**: un reviewer podría argumentar que una CNN con módulos
+paralelos entrenados con backprop lograría la misma resiliencia. La respuesta tiene
+dos partes. Primero, técnicamente es posible — y de hecho A18b usa exactamente eso
+(coordinador con backprop sobre módulos con channel grouping, 64.17%). El punto no
+es que backprop sea imposible, sino que backprop global requiere almacenar todas las
+activaciones intermedias para el backward pass, coordinar gradientes entre módulos,
+y comunicación bidireccional completa. En hardware embebido de bajo consumo (sensores
+IoT, chips edge, dispositivos con memoria limitada) esto es inviable: no hay suficiente
+RAM para el grafo computacional completo, ni ciclos de procesamiento para el backward
+pass. Forward-Forward solo necesita dos forward passes — sin almacenamiento de
+activaciones, sin backward pass, sin coordinación de gradientes. Segundo, la
+combinación específica de FF local + resiliencia estructural + Module Dropout es
+novel — no existe en literatura previa con backprop ni con FF. El resultado de A6b
+(+19.65 pts de floor con cero costo de accuracy) no ha sido demostrado con CNN
+modular backprop en ningún trabajo publicado.
+
+7. CONCLUSIÓN
+
+Este trabajo presenta OctopusNet, una arquitectura de red neuronal distribuida inspirada en el sistema nervioso del pulpo (Octopus vulgaris). Las contribuciones principales son:
+
+1. **Arquitectura modular con aprendizaje local**: cuatro módulos CNN paralelos operando a diferentes resoluciones [32,16,8,4], cada uno entrenado con Forward-Forward sin backpropagation global. La especialización por escala emerge del entrenamiento, no del diseño explícito.
+
+2. **Codificación Fourier + multi-escala**: combinación novel de patrones sinusoidales por clase (Codellaro et al., 2025) con entradas multi-resolución. La señal Fourier se amplifica naturalmente en resoluciones bajas (sep=0.07 a 32×32 vs sep=0.61 a 4×4), resolviendo el problema de dilución de goodness.
+
+3. **Resiliencia estructural ante fallos**: OctopusNet A6b mantiene mínimo 61.12% ante el fallo de cualquier módulo individual, y 52.87% ante fallo simultáneo de dos módulos. CNN equivalente colapsa a 10% (azar) ante cualquier fallo. La diferencia es estructural — paralelismo modular vs serialización secuencial.
+
+4. **Channel Grouping + Module Dropout**: combinación de técnicas que produce el mejor resultado en todas las métricas simultáneamente. 64.34% accuracy, floor 61.12% (single failure), floor 52.87% (double failure). Sin tradeoff entre accuracy y resiliencia.
+
+5. **Ablación sistemática**: nerve ring redundante para CIFAR-10 (+0.07%), bottleneck óptimo B=64, separación FF confirma convergencia correcta (sep >1.8 en todos los módulos tras entrenamiento completo).
+
+El hallazgo central es que resiliencia estructural y accuracy no son tradeoff irreconciliable. Con la arquitectura correcta (CG + ModDrop), OctopusNet alcanza 64.34% con degradación máxima de −3.22 puntos ante cualquier fallo simple. OctopusNet no compite con CNN backprop en accuracy puro — compite en el espacio donde los fallos no son opción: robótica, IoT crítico, vehículos autónomos, sistemas embebidos con múltiples sensores.
+
+7.1 Trabajo Futuro
+
+We identify three promising extensions to CGCNNModule that address its current limitations
+without sacrificing the specialization signal that makes it effective:
+
+**Extensiones a CGCNNModule**:
+
+- **Hierarchical grouping** (escalabilidad): para datasets con muchas clases (CIFAR-100,
+  ImageNet), agrupar clases en superclases primero (CIFAR-100 ya tiene 20 superclases
+  definidas) y asignar grupos de canales por superclase. Reduce la explosión lineal de
+  canales (1000 clases × 16 = 16000 canales) a algo manejable. Comparar flat vs
+  hierarchical grouping — no asumir que jerarquía siempre ayuda.
+
+- **Soft grouping** (flexibilidad representacional): reemplazar la asignación fija
+  canal→clase por una matriz aprendible W con softmax de temperatura baja (τ≈0.3).
+  Inicializar como hard grouping (bloques diagonales) y relajar gradualmente.
+  Riesgo principal: colapso a mezcla uniforme si W pierde estructura. Detección temprana:
+  monitorear entropía de W por epoch — si sube rápido en primeras épocas, activar
+  regularización de entropía condicionalmente (if entropy > threshold). Más flexible
+  para imágenes ambiguas; más difícil de interpretar.
+
+- **Adaptive channels-per-group** (eficiencia): redistribuir capacidad de canales según
+  dificultad empírica por clase — clases con alta tasa de confusión (e.g., cat/dog)
+  reciben más canales. Conecta con los pesos de atención del coordinador y la
+  especialización observada en A18b/A6b.
+
+**Otras líneas**:
+
+- **CIFAR-100 y datasets de mayor escala**: validar si la arquitectura escala a 100 clases y resoluciones mayores
+- **Sleep phase**: cada módulo genera sus propios negativos via decoder CNN transpuesto, eliminando la dependencia de Fourier externo — más biológico, potencialmente más rico
+- **Coordinador completamente local**: reemplazar backprop del coordinador con Forward Target Propagation (2025) para aprendizaje 100% local
+- **Hardware real**: demostración en Raspberry Pi o NVIDIA Jetson — validar latencia <10ms y resiliencia ante fallo físico de sensor
+- **Datos multimodales**: módulos especializados por modalidad (cámara, LiDAR, micrófono) con nerve ring para coordinación inter-modal antes del coordinador central
+- **Múltiples corridas ModDrop**: confirmar con N≥3 corridas si la mejora de accuracy es consistente o varianza de inicialización
+
+8. REFERENCIAS
+
+[1] Sumbre, G., Gutfreund, Y., Fiorito, G., Flash, T., & Hochner, B. - Control of Octopus Arm Extension by a Peripheral Motor Program. Science 293, 1845-1848 (2001)
+[2] Gutnick, T., Zullo, L., Hochner, B., & Kuba, M. - Use of Peripheral Sensory Information for Central Nervous Control of Arm Movement by Octopus vulgaris. Current Biology (2020)
+[3] Olson, C.S., Schulz, N.G., & Ragsdale, C.W. - Neuronal segmentation in cephalopod arms. Nature Communications 16, DOI: 10.1038/s41467-024-55475-5 (2025)
+[4] Hochner, B. - An Embodied View of Octopus Neurobiology. Current Biology 22(20), R887-R892 (2012)
+[5] Hinton, G. - The Forward-Forward Algorithm: Some Preliminary Investigations. arXiv:2212.13345 (2022)
+[6] McMahan, H.B., Moore, E., Ramage, D., Hampson, S., & y Arcas, B.A. - Communication-Efficient Learning of Deep Networks from Decentralized Data (FedAvg). AISTATS (2017)
+[7] Tishby, N. & Schwartz-Ziv, R. - Opening the Black Box of Deep Neural Networks via Information. arXiv:1703.00810 (2017; originalmente presentado 2015)
+[8] Löwe, S., O'Connor, P., & Veeling, B. - Putting An End to End-to-End: Gradient-Isolated Learning of Representations (Greedy InfoMax). NeurIPS (2019)
+[9] Pfeiffer, J., Ruder, S., Gurevych, I., & Grave, E. - Modular Deep Learning. TMLR Survey (2023)
+[10] Lin, Y., Han, S., Mao, H., Wang, Y., & Dally, W.J. - Deep Gradient Compression: Reducing the Communication Bandwidth for Distributed Training. ICLR (2018)
+[11] SCFF - Self-Contrastive Forward-Forward Algorithm. Nature Communications (2025)
+[12] Lee, G., Shin, J., & Kim, H. - VFF-Net: Evolving forward-forward algorithms into convolutional neural networks for enhanced computational insights. Neural Networks 190, DOI: 10.1016/j.neunet.2025.107697 (2025)
+[13] Krutsylo, A. - Scalable Forward-Forward Algorithm (SFF). arXiv:2501.03176 (2025)
+[14] Béna, G. & Goodman, D.F.M. - Dynamics of specialization in neural modules under resource constraints. Nature Communications 16, 187 (2025)
+[15] Rumelhart, D.E., Hinton, G.E., & Williams, R.J. - Learning representations by back-propagating errors. Nature 323, 533-536 (1986)
+[16] Goyal, A., Didolkar, A., Lamb, A., Badola, K., Ke, N.R., Rahimi, A., Binas, J., Blundell, C., Mozer, M., & Bengio, Y. - Coordination Among Neural Modules Through a Shared Global Workspace. ICLR (2022)
+[17] Kao, C-H. & Hariharan, B. - Counter-Current Learning: A Biologically Plausible Dual Network Approach for Deep Learning. NeurIPS (2024). arXiv:2409.19841
+[18] As-Saquib, N.S., Abeer, A.N.M.N., Chien, H-T., Yoon, B-J., Kumar, S., & Yi, S-I. - Forward Target Propagation: A Forward-Only Approach to Global Error Credit Assignment via Local Losses. arXiv:2506.11030 (2025)
+[19] Kang, B. et al. - Credit Assignment via Neural Manifold Noise Correlation. arXiv:2601.02636 (2026)
+[20] Goeckner, A., Sui, Y., Martinet, N., Li, X., & Zhu, Q. - Graph Neural Network-based Multi-agent Reinforcement Learning for Resilient Distributed Coordination of Multi-Robot Systems (MAGEC). arXiv:2403.13093 (2024)
+[21] Baars, B.J. - A Cognitive Theory of Consciousness. Cambridge University Press (1988)
+[22] Konkle, T., Alvarez, G.A., et al. - Cognitive Steering in Deep Neural Networks via Long-Range Modulatory Feedback. NeurIPS (2023)
+[23] ASGE - Adaptive Spatial Goodness Encoding: Advancing and Scaling Forward-Forward Learning Without Backpropagation. arXiv:2509.12394 (2025)
+[24] Krotov, D. & Hopfield, J. - Training CNNs with the Forward-Forward Algorithm. arXiv:2312.14924 (2023)
+[25] Ortiz Torres, D. et al. - On Advancements of the Forward-Forward Algorithm. arXiv:2504.21662 (2025)
+[26] Yamins, D.L.K. & DiCarlo, J.J. - Using goal-driven deep learning models to understand sensory cortex. Nature Neuroscience 19, 356-365 (2016)
+[27] Codellaro, R., Kulkarni, A., Alves, F., & Schröter, M. - Training CNNs with Forward-Forward: Fourier spatial label encoding. Scientific Reports (2025)
+
