@@ -1914,6 +1914,83 @@ novel — no existe en literatura previa con backprop ni con FF. El resultado de
 (+19.65 pts de floor con cero costo de accuracy) no ha sido demostrado con CNN
 modular backprop en ningún trabajo publicado.
 
+6.9 OctopusNet como Estudio de Representación Distribuida bajo Bandwidth Constraints
+
+La interpretación más profunda de OctopusNet no es "FF + módulos = resiliencia".
+Es: ¿qué emerge cuando agentes locales deben colaborar a través de un canal de
+ancho de banda fijo?
+
+El bottleneck de 64 dimensiones no es un parámetro de arquitectura — es un
+**protocolo de comunicación**. Cada módulo tiene que comprimir todo lo que aprendió
+de su resolución en 64 números que el coordinador pueda leer. La pregunta empírica
+que OctopusNet responde es qué tipo de representaciones emergen bajo ese constraint.
+
+**Evidencia experimental del protocolo como factor causal:**
+
+Los resultados no son explicables solo por la calidad del aprendizaje FF — son
+explicables por las propiedades del canal de comunicación:
+
+- A2 (bottleneck 32→64): +0.278 de separación FF — más bandwidth, mejor protocolo
+- A21 (pool→stride conv): compresión aprendida vs fija — el módulo aprende QUÉ enviar,
+  no solo cómo comprimir. +4.88% accuracy sobre A6b.
+- A19 (ResBlocks): profundidad adicional no ayuda porque el pool fijo destruye la
+  información construida antes de llegar al canal. El bottleneck era el cuello,
+  no la capacidad de los módulos.
+- A20 (pool 4×4→6×6): más bandwidth espacial es peor — señal de que la información
+  útil ya estaba codificada, no faltaba capacidad.
+- Module dropout p=0.7: ruido deliberado en el canal — fuerza a cada módulo a
+  codificar información autosuficiente. Análogo a dropout en neuronas, pero a nivel
+  de canal de comunicación entre agentes.
+
+**Conexión con teoría de información:**
+
+El framework de Information Bottleneck (Tishby et al., 2000) plantea que el
+aprendizaje óptimo maximiza I(Z;Y) — información sobre la etiqueta — mientras
+minimiza I(X;Z) — información retenida de la entrada. El bottleneck de 64 dims
+impone el segundo constraint por construcción. Lo que OctopusNet añade es que
+son N agentes comprimiendo en paralelo hacia el mismo coordinador — cada uno
+maximizando I(Z_i;Y) sobre su resolución, con el constraint adicional de que
+Z_1...Z_N deben ser complementarios para que el coordinador los pueda combinar.
+
+**La especialización como solución de equilibrio:**
+
+Module dropout p=0.7 crea el incentivo para la complementariedad: si el módulo i
+puede ser zerado el 70% del tiempo, el coordinador no puede depender de él. Cada
+módulo tiene que ser autosuficiente Y diferente de los demás — porque si M1 y M2
+codifican lo mismo, perder cualquiera de los dos es catastrófico (exactamente lo
+que se observó en A21 con p=0.5: par M[1,2]=47.69%).
+
+La solución de equilibrio es especialización emergente: cada módulo codifica la
+información más discriminativa de su resolución y que los otros módulos no pueden
+capturar. Esto es representación distribuida bajo bandwidth constraints — no por
+diseño explícito, sino como consecuencia de los incentivos del protocolo.
+
+**Implicaciones para trabajo futuro:**
+
+Esta perspectiva abre preguntas empíricas directas que los experimentos B1/B2/B3
+(pendientes) comenzarán a responder:
+
+1. ¿Qué pasa si se reduce bottleneck a 16 o 32? ¿Los módulos comprimen más o
+   colapsan? Una curva accuracy vs bottleneck con forma específica es una ley
+   empírica sobre el protocolo.
+
+2. ¿El coordinador aprende a leer un protocolo emergente o simplemente promedia?
+   Visualizar los pesos de atención en función del bottleneck respondería esto.
+
+3. ¿CNN modular backprop (B3) produce especialización comparable? Si la respuesta
+   es no — si B3 tiene accuracy similar pero floor peor — entonces FF local no
+   es solo un mecanismo de aprendizaje alternativo: es el mecanismo que produce
+   el tipo específico de compresión que genera especialización complementaria.
+
+4. ¿Existe un bottleneck óptimo teórico en función del número de clases y módulos?
+   El análogo sería el teorema de Shannon para canales ruidosos — capacidad máxima
+   de información útil por dimensión de bottleneck.
+
+En este framing, OctopusNet no es una arquitectura de clasificación de imágenes
+que usa FF. Es un sistema que estudia empíricamente cómo la distribución de
+representación emerge del diseño del protocolo de comunicación — con resiliencia
+estructural como consecuencia observable, no como objetivo de diseño directo.
+
 7. CONCLUSIÓN
 
 Este trabajo presenta OctopusNet, una arquitectura de red neuronal distribuida inspirada en el sistema nervioso del pulpo (Octopus vulgaris). Las contribuciones principales son:
