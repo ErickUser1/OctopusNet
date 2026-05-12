@@ -19,9 +19,9 @@ Centralized networks are fragile. When any component fails, the system collapses
 | OctopusNet + Stride Conv + ModDrop p=0.5 (A21) | 69.22% | 66.28% | 47.69% | −2.94 pts |
 | OctopusNet + Stride Conv + ModDrop p=0.7 (A21b) | **68.65%** | **67.03%** | **56.03%** | **−1.62 pts** |
 
-FF standard had one catastrophic failure point — losing M1 dropped accuracy to 13.89%, near random chance. Channel grouping eliminates that. Module Dropout goes further: every single-module failure stays above 61%, and even with two modules dead simultaneously the system holds above 52%. The floor is structural, not lucky.
+FF standard had one catastrophic failure point — losing M1 dropped accuracy to 13.89%, near random chance. Channel grouping eliminates that. Stride conv + Module Dropout p=0.7 (A21b) goes further: every single-module failure stays above 67%, every double-module failure stays above 56%. The floor is structural, not lucky.
 
-Module Dropout costs nothing in normal accuracy (64.34% vs 64.17%) and adds +19.65 points of resilience floor. It is now the default training mode.
+A21b improves A6b on all three metrics simultaneously: +4.31% accuracy, +5.91pts single-failure floor, +3.16pts double-failure floor. No tradeoff.
 
 This matters for robotics, IoT, autonomous vehicles, and embedded systems where a sensor can fail at any time.
 
@@ -107,16 +107,17 @@ In SFF mode, an `AuxClassifier` attaches to each module's feature map and a `Log
 
 ### Options
 ```
---dataset          cifar10 | cifar100 | mnist  (default: cifar10)
---epochs           int                          (default: 50)
---batch_size       int                          (default: 128)
---bottleneck       int                          (default: 64)
---use_sff          flag                         100% local SFF mode
---channel_grouping flag                         CGCNNModule (A18b/A6b)
---module_dropout   float                        module dropout prob (0.5 = A6b)
---no_multiscale    flag                         disable multiscale input
---seed             int                          (default: 42)
---device           cuda | cpu                   (auto-detected)
+--dataset              cifar10 | cifar100 | mnist  (default: cifar10)
+--epochs               int                          (default: 30)
+--batch_size           int                          (default: 128)
+--bottleneck           int                          (default: 64)
+--use_sff              flag                         100% local SFF mode
+--no_channel_grouping  flag                         disable CGCNNModule (on by default)
+--no_stride_compress   flag                         disable stride conv, use pool (A6b mode)
+--module_dropout       float                        module dropout prob (default: 0.7 = A21b)
+--no_multiscale        flag                         disable multiscale input
+--seed                 int                          (default: 42)
+--device               cuda | cpu                   (auto-detected)
 ```
 
 ---
