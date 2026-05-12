@@ -1,6 +1,6 @@
 # 🐙 OctopusNet
 
-OctopusNet is a modular neural network that learns without global backpropagation. Four independent modules process the same image at different resolutions, each trained locally with Hinton's Forward-Forward algorithm, and a central coordinator aggregates their outputs via attention. The result: **64.34% on CIFAR-10 with zero global gradients between modules — and a resilience floor of 61.12% when any single module fails**.
+OctopusNet is a modular neural network that learns without global backpropagation. Four independent modules process the same image at different resolutions, each trained locally with Hinton's Forward-Forward algorithm, and a central coordinator aggregates their outputs via attention. The result: **68.65% on CIFAR-10 with zero global gradients between modules — and a resilience floor of 67.03% when any single module fails**.
 
 The design is inspired by the octopus nervous system, where ~2/3 of neurons live in the arms and compute locally before sending signals to the brain. Each module here is an arm.
 
@@ -10,12 +10,14 @@ The design is inspired by the octopus nervous system, where ~2/3 of neurons live
 
 Centralized networks are fragile. When any component fails, the system collapses.
 
-| Model | Normal accuracy | Critical module fails | Two modules fail | Degradation |
-|-------|----------------|-----------------------|-----------------|-------------|
+| Model | Normal accuracy | Single module fails | Two modules fail | Degradation |
+|-------|----------------|--------------------|-----------------|-------------|
 | CNN (backprop) | **90.96%** | 10.00% (random chance) | — | −80.96 pts |
 | OctopusNet (FF) | 52.50% | 41.72% | ~30% | −10.78 pts |
 | OctopusNet + Channel Grouping (A18b) | 64.17% | 41.47% | 22.32% | −22.70 pts |
-| OctopusNet + CG + Module Dropout (A6b) | **64.34%** | **61.12%** | **52.87%** | **−3.22 pts** |
+| OctopusNet + CG + Module Dropout (A6b) | 64.34% | 61.12% | 52.87% | −3.22 pts |
+| OctopusNet + Stride Conv + ModDrop p=0.5 (A21) | 69.22% | 66.28% | 47.69% | −2.94 pts |
+| OctopusNet + Stride Conv + ModDrop p=0.7 (A21b) | **68.65%** | **67.03%** | **56.03%** | **−1.62 pts** |
 
 FF standard had one catastrophic failure point — losing M1 dropped accuracy to 13.89%, near random chance. Channel grouping eliminates that. Module Dropout goes further: every single-module failure stays above 61%, and even with two modules dead simultaneously the system holds above 52%. The floor is structural, not lucky.
 
@@ -50,8 +52,10 @@ Each module learns to distinguish **positive samples** (image + correct label ov
 | FF modules + backprop coordinator | 52.75% | 100 | Standard mode |
 | FF modules + SFF local coordinator | 53.16% | 100 | 100% local learning |
 | Simple ensemble average (SFF) | 53.59% | 100 | Best fully local result |
-| Channel Grouping + coordinator | 64.17% | 30 | A18b |
-| Channel Grouping + Module Dropout | **64.34%** | 30 | Best overall (A6b) — floor 61.12% |
+| Channel Grouping + coordinator (A18b) | 64.17% | 30 | Floor 41.47% |
+| Channel Grouping + Module Dropout p=0.5 (A6b) | 64.34% | 30 | Floor 61.12% |
+| CG + Stride Conv + ModDrop p=0.5 (A21) | 69.22% | 30 | Floor single 66.28%, floor doble 47.69% |
+| CG + Stride Conv + ModDrop p=0.7 (A21b) | **68.65%** | 30 | **Best overall** — floor single 67.03%, floor doble 56.03% |
 
 ### Module specialization (A15b)
 
@@ -77,11 +81,17 @@ Each module specializes in different classes:
 
 ## Training Modes
 
-### A6b mode: best overall (recommended)
+### A21b mode: best overall (recommended)
+```bash
+python train.py --channel_grouping --module_dropout 0.7 --stride_compress --epochs 30
+```
+68.65% accuracy, single-failure floor 67.03%, double-failure floor 56.03%. Stride conv compression + Module Dropout p=0.7.
+
+### A6b mode: best accuracy/resilience balance (no stride conv)
 ```bash
 python train.py --channel_grouping --module_dropout 0.5 --epochs 30
 ```
-64.34% accuracy, single-failure floor 61.12%. Channel grouping (Ortiz Torres et al.) + Module Dropout.
+64.34% accuracy, single-failure floor 61.12%.
 
 ### Standard mode (FF + backprop coordinator)
 ```bash
@@ -166,6 +176,12 @@ Upload `OctopusNet_Colab.ipynb` to Colab and run cells. Includes all experiments
 | A15b | SFF local coordinator | 53.16%: best fully local mode |
 | A18b | Channel grouping (Ortiz Torres) | 64.17%: eliminates catastrophic failures, floor 41.47% |
 | A6b | Channel grouping + Module Dropout | 64.34%: floor jumps to 61.12% — +19.65 pts vs A18b, no accuracy cost |
+| A17 | Iterative nerve ring (N rounds) | Rounds=1 optimal — more rounds homogenize representations, hurt accuracy |
+| A19 | CGCNNModule + ResBlocks | 63.24%: FF doesn't scale in depth — pool destroys what ResBlocks build |
+| A20 | Pool 4×4 → 6×6 | 61.49%: larger pool is worse — spatial pooling was not the bottleneck |
+| A21 | Pool → stride conv (learned compression) | 69.22%: +4.88pts over A6b, but floor doble 47.69% (M1+M2 co-specialized) |
+| A21b | Stride conv + Module Dropout p=0.7 | **68.65%: best overall** — floor single 67.03%, floor doble 56.03%, no catastrophic pairs |
+| A22 | goodness pre-pool vs post-pool | 62.96%: goodness location doesn't matter — not the bottleneck |
 
 ---
 
