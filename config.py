@@ -26,7 +26,7 @@ class OctopusNetConfig:
 
     # Architecture
     num_modules: int = 4
-    bottleneck_size: int = 32
+    bottleneck_size: int = 64
     num_classes: int = 10
 
     # Module configs (homogeneous by default)
@@ -59,19 +59,23 @@ class OctopusNetConfig:
     ff_epochs_per_layer: int = 100
     # Channel grouping (Ortiz Torres et al., arXiv:2504.21662)
     # Replaces CNNModule with CGCNNModule — no x_neg needed, goodness per class group
-    ff_channel_grouping: bool = False
+    ff_channel_grouping: bool = True
     cg_channels_per_group: int = 16  # total channels = num_classes * cg_channels_per_group
 
-    # Module Dropout (A6b): zero random module during coordinator training
-    # p=0.5 confirmed optimal — forces coordinator to not depend on any single module
-    module_dropout_prob: float = 0.0
+    # Stride conv compression (A21b): reemplaza AdaptiveAvgPool2d con Conv2d(stride=2)
+    # Confirmed: 68.65% CIFAR-10, floor single 67.03%, floor doble 56.03%
+    use_stride_compress: bool = True
+
+    # Module Dropout (A21b): zero random module during coordinator training
+    # p=0.7 confirmed optimal with stride conv — distributes specialization uniformly
+    module_dropout_prob: float = 0.7
 
     # Coordinator
     coordinator_hidden: int = 256
 
     # Training
     learning_rate: float = 0.001
-    epochs: int = 100
+    epochs: int = 30
     device: str = "cuda"
 
     # Peer normalization (from loeweX repo)
@@ -144,14 +148,29 @@ def get_channel_grouping_config(dataset="cifar10"):
     )
 
 def get_a6b_config(dataset="cifar10"):
-    """A6b: Channel Grouping + Module Dropout — best overall config.
+    """A6b: Channel Grouping + Module Dropout p=0.5 (no stride conv).
     64.34% accuracy, single-failure floor 61.12%, double-failure floor 52.87%.
     """
     return OctopusNetConfig(
         dataset=dataset,
         ff_channel_grouping=True,
+        use_stride_compress=False,
         cg_channels_per_group=16,
         module_dropout_prob=0.5,
+        epochs=30,
+        bottleneck_size=64,
+    )
+
+def get_a21b_config(dataset="cifar10"):
+    """A21b: Stride Conv + Module Dropout p=0.7 — best overall config.
+    68.65% accuracy, single-failure floor 67.03%, double-failure floor 56.03%.
+    """
+    return OctopusNetConfig(
+        dataset=dataset,
+        ff_channel_grouping=True,
+        use_stride_compress=True,
+        cg_channels_per_group=16,
+        module_dropout_prob=0.7,
         epochs=30,
         bottleneck_size=64,
     )

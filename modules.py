@@ -472,6 +472,7 @@ def create_modules(config):
     use_multiscale = getattr(config, 'use_multiscale', False)
     input_scales = getattr(config, 'input_scales', None)
     use_grouping = getattr(config, 'ff_channel_grouping', False)
+    use_stride = getattr(config, 'use_stride_compress', False)
     num_classes = getattr(config, 'num_classes', 10)
     cpg = getattr(config, 'cg_channels_per_group', 16)
 
@@ -480,7 +481,15 @@ def create_modules(config):
 
     if config.homogeneous:
         for i, kernel_size in enumerate(config.kernel_sizes[:config.num_modules]):
-            if use_grouping:
+            if use_grouping and use_stride:
+                module = CGCNNModuleA21(
+                    num_classes=num_classes,
+                    channels_per_group=cpg,
+                    kernel_size=cg_kernel_sizes[i],
+                    in_channels=in_channels,
+                    bottleneck_size=config.bottleneck_size,
+                )
+            elif use_grouping:
                 module = CGCNNModule(
                     num_classes=num_classes,
                     channels_per_group=cpg,
@@ -570,6 +579,57 @@ class CGCNNModule(nn.Module):
 
     def goodness_per_group(self, x):
         feat = self.conv(x)
+        B, C, H, W = feat.shape
+        return feat.view(B, self.num_classes, self.cpg, H * W).pow(2).mean(dim=[2, 3])
+
+    def ff_loss(self, x, labels, threshold=2.0):
+        g = self.goodness_per_group(x)
+        g_target = g[torch.arange(len(labels)), labels]
+        mask = torch.ones_like(g, dtype=torch.bool)
+        mask[torch.arange(len(labels)), labels] = False
+        g_wrong = g[mask].view(len(labels), self.num_classes - 1).mean(dim=1)
+        return F.softplus(-g_target + threshold).mean() + F.softplus(g_wrong - threshold).mean()
+
+
+class CGCNNModuleA21(nn.Module):
+    """
+    A21b: stride conv x2 en vez de AdaptiveAvgPool2d(4) — compresión aprendida.
+    Igual que CGCNNModule pero reemplaza pool fijo con Conv2d(stride=2) entrenables.
+    A21b results: 68.65% CIFAR-10, single-failure floor 67.03%, double-failure floor 56.03%.
+    """
+
+    def __init__(self, num_classes=10, channels_per_group=16,
+                 kernel_size=3, in_channels=3, bottleneck_size=64):
+        super().__init__()
+        self.num_classes = num_classes
+        self.cpg = channels_per_group
+        total_ch = num_classes * channels_per_group
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, total_ch, kernel_size, padding=kernel_size // 2),
+            nn.BatchNorm2d(total_ch),
+            nn.ReLU(),
+            nn.Conv2d(total_ch, total_ch, kernel_size, padding=kernel_size // 2,
+                      groups=num_classes),
+            nn.BatchNorm2d(total_ch),
+            nn.ReLU(),
+        )
+        self.compress = nn.Sequential(
+            nn.Conv2d(total_ch, total_ch, 3, stride=2, padding=1, groups=num_classes),
+            nn.BatchNorm2d(total_ch),
+            nn.ReLU(),
+            nn.Conv2d(total_ch, total_ch, 3, stride=2, padding=1, groups=num_classes),
+            nn.BatchNorm2d(total_ch),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(4),
+        )
+        self.proj = nn.Linear(total_ch * 16, bottleneck_size)
+
+    def _features(self, x): return self.conv(x)
+    def forward(self, x): return self.proj(self.compress(self._features(x)).flatten(1))
+
+    def goodness_per_group(self, x):
+        feat = self.compress(self._features(x))
         B, C, H, W = feat.shape
         return feat.view(B, self.num_classes, self.cpg, H * W).pow(2).mean(dim=[2, 3])
 

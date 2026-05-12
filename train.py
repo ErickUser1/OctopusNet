@@ -309,7 +309,7 @@ def train(config, use_sff=False, seed=42):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train OctopusNet")
     parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar100', 'mnist'])
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--bottleneck', type=int, default=64)
     parser.add_argument('--use_sff', action='store_true',
@@ -317,13 +317,18 @@ if __name__ == "__main__":
                              'Best accuracy: 53.16%% on CIFAR-10.')
     parser.add_argument('--no_multiscale', action='store_true',
                         help='Disable multiscale input. Default: ON.')
-    parser.add_argument('--channel_grouping', action='store_true',
-                        help='Use CGCNNModule (Ortiz Torres et al.). '
-                             'Best accuracy: 64.34%% CIFAR-10.')
-    parser.add_argument('--module_dropout', type=float, default=0.0,
+    parser.add_argument('--channel_grouping', action='store_true', default=True,
+                        help='Use CGCNNModule (Ortiz Torres et al.). Default: ON (A21b).')
+    parser.add_argument('--no_channel_grouping', dest='channel_grouping', action='store_false',
+                        help='Disable channel grouping.')
+    parser.add_argument('--stride_compress', action='store_true', default=True,
+                        help='Use stride conv compression instead of AdaptiveAvgPool (A21b). Default: ON.')
+    parser.add_argument('--no_stride_compress', dest='stride_compress', action='store_false',
+                        help='Disable stride conv compression (falls back to A6b pool).')
+    parser.add_argument('--module_dropout', type=float, default=0.7,
                         help='Module dropout probability during coordinator training. '
-                             'p=0.5 recommended with --channel_grouping (A6b config). '
-                             'Raises single-failure floor from 41.47%% to 61.12%%.')
+                             'p=0.7 default (A21b). Use p=0.5 for A6b config. '
+                             'Raises single-failure floor: A21b floor 67.03%%.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
@@ -336,6 +341,7 @@ if __name__ == "__main__":
         device=args.device,
         use_multiscale=not args.no_multiscale,
         ff_channel_grouping=args.channel_grouping,
+        use_stride_compress=args.stride_compress,
         module_dropout_prob=args.module_dropout,
     )
 
