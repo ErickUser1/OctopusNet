@@ -208,6 +208,12 @@ Upload `OctopusNet_Colab.ipynb` to Colab and run cells. Includes all experiments
 
 ---
 
+## Get in touch
+
+If you're running experiments with this or building something on top of it, I'd genuinely like to know. Email me at erickarriolaaguillon123@gmail.com or open a Discussion.
+
+---
+
 ## Cite
 
 If you use OctopusNet in your research:
